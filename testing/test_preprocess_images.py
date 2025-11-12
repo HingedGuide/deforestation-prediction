@@ -1,4 +1,24 @@
 from preprocess_images import *
+import numpy as np
+import rasterio
+from rasterio.transform import from_origin
+
+def _write_tif(path, array, *, dtype="float32"):
+    """Write a single-band GeoTIFF with a dummy transform/CRS."""
+    array = np.asarray(array).astype(dtype)
+    h, w = array.shape
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=h,
+        width=w,
+        count=1,
+        dtype=dtype,
+        crs="EPSG:4326",
+        transform=from_origin(0, 0, 1, 1),
+    ) as dst:
+        dst.write(array, 1)
 
 
 def test_parse_filename():
@@ -234,3 +254,109 @@ def test_build_sample(tmp_path):
     assert len(meta["dates"]) == 2
     assert meta["dates"][0] == datetime(2023, 8, 1)
     assert meta["dates"][1] == datetime(2023, 9, 1)
+
+
+def test_compute_variable_maxima(tmp_path):
+    """
+    varA across 2 files: max should be 10 (NaN/Inf ignored)
+    varB across 2 files: max should be 7
+    """
+    # varA
+    a1 = tmp_path / "00N_010E_2023-01-01_varA.tif"
+    _write_tif(a1, [[1, 2], [np.nan, 10]])
+    a2 = tmp_path / "00N_010E_2023-02-01_varA.tif"
+    _write_tif(a2, [[3, 4], [5, np.inf]])
+
+    # varB
+    b1 = tmp_path / "00N_010E_2023-01-01_varB.tif"
+    _write_tif(b1, [[-1, 0], [6, 7]])
+    b2 = tmp_path / "00N_010E_2023-02-01_varB.tif"
+    _write_tif(b2, [[-2, -3], [np.nan, 5]])
+
+    # Build a minimal catalog DataFrame (reuse your builder if you like)
+    catalog = build_raster_catalog(str(tmp_path))
+
+    maxima = compute_variable_maxima(catalog)
+    assert np.isclose(maxima["varA"], 10.0)
+    assert np.isclose(maxima["varB"], 7.0)
+
+
+def test_normalize_cube_auto_clip_and_uint8(tmp_path):
+    """
+    Check: division by auto maxima, NaN/Inf -> 0, clipping to [0,1],
+    and optional uint8 casting path.
+    """
+    # Create tiny dataset for two variables
+    a1 = tmp_path / "00N_010E_2023-01-01_varA.tif"
+    _write_tif(a1, [[1.0, 2.0], [np.nan, 10.0]])
+    a2 = tmp_path / "00N_010E_2023-02-01_varA.tif"
+    _write_tif(a2, [[3.0, 4.0], [5.0, np.inf]])
+
+    b1 = tmp_path / "00N_010E_2023-01-01_varB.tif"
+    _write_tif(b1, [[-1.0, 0.0], [6.0, 7.0]])
+    b2 = tmp_path / "00N_010E_2023-02-01_varB.tif"
+    _write_tif(b2, [[-2.0, -3.0], [np.nan, 5.0]])
+
+    catalog = build_raster_catalog(str(tmp_path))
+
+    # Build a cube [V=2, T=2, H=2, W=2] in variable order ["varA", "varB"]
+    variables = ["varA", "varB"]
+    X = np.array(
+        [
+            # varA (two time steps)
+            [
+                [[1.0, 2.0], [np.nan, 10.0]],
+                [[3.0, 4.0], [5.0, np.inf]],
+            ],
+            # varB (two time steps)
+            [
+                [[-1.0, 0.0], [6.0, 7.0]],
+                [[-2.0, -3.0], [np.nan, 5.0]],
+            ],
+        ],
+        dtype=np.float32,
+    )
+
+    # 1) Float output, overflow clipped
+    Xn = normalize_cube_auto(
+        X,
+        variables=variables,
+        catalog=catalog,
+        nan_policy="zero",
+        overflow="clip",
+        cast=None,
+    )
+
+    # Expected varA: divide by 10, NaN/Inf -> 0, clip
+    exp_a_t1 = np.array([[0.1, 0.2], [0.0, 1.0]], dtype=np.float32)
+    exp_a_t2 = np.array([[0.3, 0.4], [0.5, 0.0]], dtype=np.float32)
+
+    # Expected varB: divide by 7, negatives -> clipped to 0, NaN->0
+    exp_b_t1 = np.array([[0.0, 0.0], [6/7, 1.0]], dtype=np.float32)
+    exp_b_t2 = np.array([[0.0, 0.0], [0.0, 5/7]], dtype=np.float32)
+
+    assert np.allclose(Xn[0, 0], exp_a_t1, atol=1e-6)
+    assert np.allclose(Xn[0, 1], exp_a_t2, atol=1e-6)
+    assert np.allclose(Xn[1, 0], exp_b_t1, atol=1e-6)
+    assert np.allclose(Xn[1, 1], exp_b_t2, atol=1e-6)
+
+    # 2) Same normalization but cast to uint8 (ensures [0,1]→[0,255] path works)
+    Xn_u8 = normalize_cube_auto(
+        X,
+        variables=variables,
+        catalog=catalog,
+        nan_policy="zero",
+        overflow="clip",
+        cast="uint8",
+    )
+    exp_u8 = np.stack(
+        [
+            np.stack([(exp_a_t1 * 255).round().astype(np.uint8),
+                      (exp_a_t2 * 255).round().astype(np.uint8)], axis=0),
+            np.stack([(exp_b_t1 * 255).round().astype(np.uint8),
+                      (exp_b_t2 * 255).round().astype(np.uint8)], axis=0),
+        ],
+        axis=0,
+    )
+    assert Xn_u8.dtype == np.uint8
+    assert np.array_equal(Xn_u8, exp_u8)
