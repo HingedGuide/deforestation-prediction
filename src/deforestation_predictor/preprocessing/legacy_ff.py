@@ -246,7 +246,6 @@ def prepare_data(tile, logger):
     dynam_var_val = np.stack(dynam_var_val, axis=0)
     dynam_var_test = np.stack(dynam_var_test, axis=0)
 
-    # TODO: this was set becuase some features have values larger thatn maximum?
     if args.normalize:
         dynam_var_train[dynam_var_train > 1] = 0
         dynam_var_val[dynam_var_val > 1] = 0
