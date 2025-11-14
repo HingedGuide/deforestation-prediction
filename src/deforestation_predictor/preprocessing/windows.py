@@ -3,8 +3,8 @@ import pandas as pd
 from pandas import DateOffset
 
 
-CONTEXT_MONTHS = 12
-GAP_MONTHS = 3
+CONTEXT_MONTHS = 3
+GAP_MONTHS = 1
 
 
 def get_input_window_range(

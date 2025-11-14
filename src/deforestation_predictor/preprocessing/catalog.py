@@ -10,7 +10,7 @@ import rasterio
 from deforestation_predictor.utils.filenames import parse_filename
 
 
-# Optional: list of variables you consider temporally aggregated and want to drop
+#TODO set this list based on the metadata documentation
 AGGREGATED_VARS: set[str] = {
     "lastsixmonths",
     "lastthreemonths",
@@ -39,27 +39,22 @@ def build_raster_catalog(
         - date
         - variable
         - path
-
-    Parameters
-    ----------
-    data_root : str
-        Root folder containing input rasters.
-    allowed_variables : list[str] | None
-        If provided, only keep rows where variable is in this list.
-        This is the safest way to ensure you only use snapshot variables.
-    drop_aggregated : bool
-        If True (and allowed_variables is None), drop variables listed
-        in AGGREGATED_VARS.
     """
-    paths = Path(data_root).rglob("*.tif")
+    paths = list(Path(data_root).rglob("*.tif"))
     records = [parse_filename(p) for p in paths]
+
+    if not records:
+        # Return an empty catalog with the expected columns instead of crashing
+        return pd.DataFrame(columns=["tile_id", "date", "variable", "path"])
 
     df = pd.DataFrame(records)
 
-    if allowed_variables is not None:
-        df = df[df["variable"].isin(allowed_variables)].copy()
-    elif drop_aggregated:
-        df = df[~df["variable"].isin(AGGREGATED_VARS)].copy()
+    # Safety: only filter if the column is present
+    if "variable" in df.columns:
+        if allowed_variables is not None:
+            df = df[df["variable"].isin(allowed_variables)].copy()
+        elif drop_aggregated:
+            df = df[~df["variable"].isin(AGGREGATED_VARS)].copy()
 
     df.sort_values(["tile_id", "date", "variable"], inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -80,7 +75,7 @@ def build_gt_catalog(gt_root: str) -> pd.DataFrame:
     records = []
     for p in paths:
         info = parse_filename(p)
-        if info["variable"].lower() != "gt":
+        if info["variable"].lower() != "groundtruth6m":
             continue
         records.append(
             {
