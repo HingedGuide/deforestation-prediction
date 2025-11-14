@@ -1,11 +1,35 @@
-from pathlib import Path
-from deforestation_predictor.utils.filenames import parse_filename
-import pandas as pd
-from datetime import datetime
-import rasterio
-import numpy as np
+from __future__ import annotations
 
-def build_raster_catalog(data_root: str) -> pd.DataFrame:
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import rasterio
+
+from deforestation_predictor.utils.filenames import parse_filename
+
+
+# Optional: list of variables you consider temporally aggregated and want to drop
+AGGREGATED_VARS: set[str] = {
+    "lastsixmonths",
+    "lastthreemonths",
+    "lastmonth",
+    "smoothedsixmonths",
+    "smoothedtotal",
+    "previoussameseason",
+    "patchdensity",
+    "totallossalerts",
+    # extend with any others you know are aggregated
+}
+
+
+def build_raster_catalog(
+    data_root: str,
+    *,
+    allowed_variables: list[str] | None = None,
+    drop_aggregated: bool = False,
+) -> pd.DataFrame:
     """
     Scan data_root recursively for .tif files and parse their metadata
     into a structured DataFrame using parse_filename().
@@ -15,11 +39,28 @@ def build_raster_catalog(data_root: str) -> pd.DataFrame:
         - date
         - variable
         - path
+
+    Parameters
+    ----------
+    data_root : str
+        Root folder containing input rasters.
+    allowed_variables : list[str] | None
+        If provided, only keep rows where variable is in this list.
+        This is the safest way to ensure you only use snapshot variables.
+    drop_aggregated : bool
+        If True (and allowed_variables is None), drop variables listed
+        in AGGREGATED_VARS.
     """
     paths = Path(data_root).rglob("*.tif")
     records = [parse_filename(p) for p in paths]
 
     df = pd.DataFrame(records)
+
+    if allowed_variables is not None:
+        df = df[df["variable"].isin(allowed_variables)].copy()
+    elif drop_aggregated:
+        df = df[~df["variable"].isin(AGGREGATED_VARS)].copy()
+
     df.sort_values(["tile_id", "date", "variable"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
@@ -92,7 +133,7 @@ def compute_variable_maxima(catalog: pd.DataFrame) -> dict[str, float]:
         - This can be slow for large datasets because it reads all rasters.
           You can sample by tile/date if needed.
     """
-    maxima = {}
+    maxima: dict[str, float] = {}
 
     for var in catalog["variable"].unique():
         var_paths = catalog.loc[catalog["variable"] == var, "path"].tolist()
