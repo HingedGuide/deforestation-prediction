@@ -188,7 +188,7 @@ def build_sample(
             use_cache=use_cache,
         )
 
-    # 5) load GT
+        # 5) load GT
     T = pd.to_datetime(target_date)
     gt_rows = gt_catalog[(gt_catalog["tile_id"] == tile_id) & (gt_catalog["date"] == T)]
     if gt_rows.empty:
@@ -196,7 +196,12 @@ def build_sample(
 
     gt_path = gt_rows["path"].iloc[0]
     with rasterio.open(gt_path) as src:
-        y = src.read(1)  # [H, W]
+        y = src.read(1).astype(np.float32)  # [H, W]
+
+    # ---- Make target binary: deforested (1) vs not-deforested (0) ----
+    # Any positive value is treated as "deforestation"
+    y_bin = np.zeros_like(y, dtype=np.uint8)
+    y_bin[y > 0] = 1
 
     meta = {
         "tile_id": tile_id,
@@ -205,4 +210,4 @@ def build_sample(
         "dates": dates,
     }
 
-    return X, y, meta
+    return X, y_bin, meta

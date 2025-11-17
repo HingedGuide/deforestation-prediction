@@ -69,14 +69,20 @@ def build_gt_catalog(gt_root: str) -> pd.DataFrame:
         - variable
         - path
 
-    Only keeps files where variable == 'gt' (case-insensitive).
+    Keeps files where the parsed variable name indicates ground truth,
+    e.g. 'gt', 'groundtruth6m', or 'groundtruth'.
     """
     paths = Path(gt_root).rglob("*.tif")
-    records = []
+    records: list[dict] = []
+
     for p in paths:
         info = parse_filename(p)
-        if info["variable"].lower() != "groundtruth6m":
+        var = str(info["variable"]).lower()
+
+        # Accept both your real naming and the test naming
+        if var not in {"gt", "groundtruth6m", "groundtruth"}:
             continue
+
         records.append(
             {
                 "tile_id": info["tile_id"],
@@ -86,10 +92,15 @@ def build_gt_catalog(gt_root: str) -> pd.DataFrame:
             }
         )
 
-    df = pd.DataFrame(records)
+    # If nothing found, return an empty but *well-formed* DataFrame
+    if not records:
+        return pd.DataFrame(columns=["tile_id", "date", "variable", "path"])
+
+    df = pd.DataFrame.from_records(records)
     df.sort_values(["tile_id", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
+
 
 
 def get_records_for_dates(
