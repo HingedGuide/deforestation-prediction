@@ -61,11 +61,52 @@ OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed_3d" / REGION_ID
 
 # Which variables you want the 3D CNN to see (snapshot / monthly)
 MONTHLY_VARS = [
-    "lastmonth",
-    "nightlights",
-    "precipitation",
-    "firealerts",
+    'firealerts',
+    'nightlights',
+    'precipitation',
+    'temperature',
+    'confidence',
+    'fwi',
+    'lastmonth',
+    'timesinceloss',
+    'totallossalerts',
+    'previoussameseason',
+    'patchdensity'
     # extend as needed
+]
+
+STATIC_VARS = [
+    "elevation",
+    "slope",
+    "wetlands",                 # if present; otherwise remove
+    "peatlands",
+    "initialforestcover",
+    "historicloss",
+    "forestheight",
+    "forestedgedensity",
+    "landpercentage",
+    "populationcurrent",
+    "populationincrease",
+    "closenesstoroads",
+    "closenesstowaterways",
+    "closenesstocropland",
+    "closenesstococoa",
+    "closenesstocoffee",
+    "closenesstofiber",
+    "closenesstosoybean",
+    "closenesstocattleabove2000",
+    "closenesstocattleabove10000",
+    "closenesstomining",
+    "palmoilmills",
+    "croplandcapacity100p",
+    "croplandcapacitybelow50p",
+    "croplandcapacityover50p",
+    "wdpa",
+    "catexcap",
+    "aridityannual",
+    "ariditydriestquarter",
+    "closenesstoforestedge",
+    # easy to add: "cattlesmoothed", "dpicoal", "dpiconvgas", ...
 ]
 
 CONTEXT = CONTEXT_MONTHS
@@ -114,16 +155,22 @@ def main():
 
     # 1) Build catalogs
     print("[1] Building input catalog (unfiltered)...")
-    catalog = build_raster_catalog(str(INPUT_ROOT))
+    full_catalog = build_raster_catalog(str(INPUT_ROOT))
 
-    print("Raw catalog rows:", len(catalog))
-    print("Raw unique variables:", sorted(catalog["variable"].unique()))
+    print("Raw catalog rows:", len(full_catalog))
+    print("Raw unique variables:", sorted(full_catalog["variable"].unique()))
 
-    # Keep only selected monthly vars
-    catalog = catalog[catalog["variable"].isin(MONTHLY_VARS)].reset_index(drop=True)
+    # Dynamic (monthly) catalog: only the vars we want as time series
+    catalog = full_catalog[full_catalog["variable"].isin(MONTHLY_VARS)].reset_index(drop=True)
 
-    print("Filtered catalog rows:", len(catalog))
-    print("Filtered unique variables:", sorted(catalog["variable"].unique()))
+    print("Filtered catalog rows (monthly):", len(catalog))
+    print("Filtered unique monthly variables:", sorted(catalog["variable"].unique()))
+
+    # Static catalog: vars we want to broadcast across time
+    static_catalog = full_catalog[full_catalog["variable"].isin(STATIC_VARS)].reset_index(drop=True)
+    print("Static catalog rows:", len(static_catalog))
+    print("Static unique variables:", sorted(static_catalog["variable"].unique()))
+
     print(
         f"    -> {len(catalog)} input records, "
         f"{catalog['variable'].nunique()} variables "
@@ -136,7 +183,9 @@ def main():
 
     # 3) Precompute maxima for normalization
     print("[3] Computing per-variable maxima for normalization...")
-    maxima = compute_variable_maxima(catalog)
+    maxima = compute_variable_maxima(
+        full_catalog[full_catalog["variable"].isin(MONTHLY_VARS + STATIC_VARS)]
+    )
 
     # 4) Build target table from GT
     print("[4] Building target table from GT...")
@@ -180,7 +229,9 @@ def main():
         gt_catalog=gt_catalog,
         maxima=maxima,
         output_root=output_root,
+        static_catalog=static_catalog,
     )
+
     build_and_save_split(
         split_name="val",
         targets=val_targets,
@@ -188,7 +239,9 @@ def main():
         gt_catalog=gt_catalog,
         maxima=maxima,
         output_root=output_root,
+        static_catalog=static_catalog,
     )
+
     build_and_save_split(
         split_name="test",
         targets=test_targets,
@@ -196,6 +249,7 @@ def main():
         gt_catalog=gt_catalog,
         maxima=maxima,
         output_root=output_root,
+        static_catalog=static_catalog,
     )
 
     print("[DONE] All samples saved.")
@@ -208,6 +262,7 @@ def build_and_save_split(
     gt_catalog: pd.DataFrame,
     maxima: dict[str, float],
     output_root: Path,
+    static_catalog: pd.DataFrame | None = None,
 ):
     """
     Loop over all (tile_id, date) targets in a split, build samples,
@@ -231,11 +286,11 @@ def build_and_save_split(
                 gt_catalog=gt_catalog,
                 context=CONTEXT,
                 gap=GAP,
+                static_catalog=static_catalog,
                 normalize=True,
                 overflow="clip",
                 nan_policy="zero",
-                cast=None,
-                use_cache=True,
+                cast="float32",
                 maxima=maxima,
             )
         except Exception as e:

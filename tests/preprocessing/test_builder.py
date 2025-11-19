@@ -9,6 +9,7 @@ from deforestation_predictor.preprocessing.catalog import (
     build_gt_catalog,
     build_raster_catalog,
     get_records_for_dates,
+    compute_variable_maxima,
 )
 
 import pytest
@@ -210,11 +211,12 @@ def test_build_sample(tmp_path):
         datetime(2023, 8, 1),
         datetime(2023, 9, 1),
     ]
-    variables = ["wetlands", "elevation"]
+    dyn_vars = ["wetlands", "elevation"]
+    static_var = "slope"
 
-    # Create input rasters for both dates and variables
+    # ---- Create dynamic input rasters for both dates and variables ----
     for d in input_dates:
-        for v in variables:
+        for v in dyn_vars:
             fname = f"00N_010E_{d.date()}_{v}.tif"
             data = np.random.randint(0, 255, size=data_shape, dtype=np.uint8)
 
@@ -229,7 +231,12 @@ def test_build_sample(tmp_path):
             ) as dst:
                 dst.write(data, 1)
 
-    # Create GT raster for target_date
+    # ---- Create a static raster (e.g. slope) with a known constant value ----
+    slope_value = 5.0
+    slope_fname = tmp_path / "00N_010E_2021-01-01_slope.tif"
+    _write_tif(slope_fname, np.full(data_shape, slope_value, dtype=np.float32))
+
+    # ---- Create GT raster for target_date ----
     target_date = datetime(2023, 10, 1)
     gt_fname = f"00N_010E_{target_date.date()}_gt.tif"
     gt_data = np.random.randint(0, 2, size=data_shape, dtype=np.uint8)
@@ -245,20 +252,34 @@ def test_build_sample(tmp_path):
     ) as dst:
         dst.write(gt_data, 1)
 
-    catalog = build_raster_catalog(str(tmp_path))
+    # ---- Build catalogs ----
+    full_catalog = build_raster_catalog(str(tmp_path))
     gt_catalog = build_gt_catalog(str(tmp_path))
 
+    # Dynamic catalog: only the monthly vars
+    dyn_catalog = full_catalog[full_catalog["variable"].isin(dyn_vars)].reset_index(drop=True)
+
+    # Static catalog: only slope
+    static_catalog = full_catalog[full_catalog["variable"] == static_var].reset_index(drop=True)
+
+    # Maxima for normalization (both dynamic + static)
+    maxima = compute_variable_maxima(full_catalog)
+
+    # ---- Build sample with static_catalog + maxima ----
     X, y, meta = build_sample(
         "00N_010E",
         target_date,
-        catalog,
+        dyn_catalog,
         gt_catalog,
         context=2,
         gap=1,
+        static_catalog=static_catalog,
+        maxima=maxima,
     )
 
-    # Input cube shape [V, T, H, W]
-    assert X.shape == (len(variables), 2, data_shape[0], data_shape[1])
+    # V = dynamic vars + static vars = 2 + 1 = 3, T = 2
+    expected_V = len(dyn_vars) + 1
+    assert X.shape == (expected_V, 2, data_shape[0], data_shape[1])
 
     # GT shape
     assert y.shape == data_shape
@@ -266,10 +287,25 @@ def test_build_sample(tmp_path):
     # Meta sanity checks
     assert meta["tile_id"] == "00N_010E"
     assert meta["target_date"] == pd.to_datetime(target_date)
-    assert set(meta["variables"]) == set(variables)
+
+    expected_vars = set(dyn_vars + [static_var])
+    assert set(meta["variables"]) == expected_vars
+
     assert len(meta["dates"]) == 2
     assert meta["dates"][0] == datetime(2023, 8, 1)
     assert meta["dates"][1] == datetime(2023, 9, 1)
+
+    # ---- Check that the static channel is broadcast over time and normalized ----
+    slope_idx = meta["variables"].index(static_var)
+
+    # maxima['slope'] should be slope_value (only one raster with value 5.0)
+    assert maxima[static_var] == pytest.approx(slope_value)
+
+    # After normalization: slope array should be all ones, same for both timesteps
+    expected_static = np.ones(data_shape, dtype=np.float32)
+
+    assert np.allclose(X[slope_idx, 0], expected_static)
+    assert np.allclose(X[slope_idx, 1], expected_static)
 
 
 def test_balanced_random_spatial_crops_shapes_and_balance():

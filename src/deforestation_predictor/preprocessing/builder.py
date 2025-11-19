@@ -149,6 +149,7 @@ def build_sample(
     context: int = CONTEXT_MONTHS,
     gap: int = GAP_MONTHS,
     *,
+    static_catalog: pd.DataFrame | None = None,
     normalize: bool = True,
     overflow: str = "clip",
     nan_policy: str = "zero",
@@ -187,8 +188,47 @@ def build_sample(
             cast=cast,
             use_cache=use_cache,
         )
+        if static_catalog is not None and not static_catalog.empty:
+            static_records = static_catalog[static_catalog["tile_id"] == tile_id]
 
-        # 5) load GT
+            if not static_records.empty:
+                static_vars = sorted(static_records["variable"].unique())
+                static_arrays = []
+
+                for v in static_vars:
+                    # some static vars have multiple years; take the most recent snapshot
+                    rows_v = static_records[static_records["variable"] == v].sort_values("date")
+                    path = rows_v["path"].iloc[-1]
+                    with rasterio.open(path) as src:
+                        arr = src.read(1).astype(np.float32)  # [H, W]
+                    static_arrays.append(arr)
+
+                static_cube = np.stack(static_arrays, axis=0)  # [V_static, H, W]
+
+                # normalize static vars using same maxima dict
+                if normalize:
+                    static_cube_4d = static_cube[:, None, :, :]  # [V_static, 1, H, W]
+                    static_cube_4d = normalize_cube_auto(
+                        static_cube_4d,
+                        static_vars,
+                        catalog=None,
+                        maxima=maxima,
+                        nan_policy=nan_policy,
+                        overflow=overflow,
+                        cast=None,  # keep full precision here; casting happens later if you want
+                        use_cache=False,
+                    )
+                    static_cube = static_cube_4d[:, 0, :, :]  # back to [V_static, H, W]
+
+                # broadcast over time dimension
+                V_dyn, T_len, H, W = X.shape
+                static_broadcast = np.repeat(static_cube[:, None, :, :], T_len, axis=1)  # [V_static, T, H, W]
+
+                # concatenate along channel dimension
+                X = np.concatenate([X, static_broadcast], axis=0)
+                variables = list(variables) + static_vars
+
+    # 5) load GT
     T = pd.to_datetime(target_date)
     gt_rows = gt_catalog[(gt_catalog["tile_id"] == tile_id) & (gt_catalog["date"] == T)]
     if gt_rows.empty:
