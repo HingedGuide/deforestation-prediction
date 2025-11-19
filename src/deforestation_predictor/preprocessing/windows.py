@@ -3,8 +3,9 @@ import pandas as pd
 from pandas import DateOffset
 
 
-CONTEXT_MONTHS = 3
-GAP_MONTHS = 1
+CONTEXT_MONTHS = 12  # number of months in the input window
+GAP_MONTHS = 1       # number of months gap between input and target. I changed this to 1 because I no longer use
+                     # the aggregated monthly inputs (e.g. lastthreemonths)
 
 
 def get_input_window_range(
