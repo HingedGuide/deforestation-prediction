@@ -16,7 +16,10 @@ from deforestation_predictor.preprocessing.splits import (
     split_targets_by_time,
     TemporalSplitConfig,
 )
-from deforestation_predictor.preprocessing.builder import build_sample
+from deforestation_predictor.preprocessing.builder import (
+    build_sample,
+    balanced_random_spatial_crops
+)
 from deforestation_predictor.preprocessing.windows import (
     CONTEXT_MONTHS,
     GAP_MONTHS,
@@ -74,6 +77,17 @@ SPLIT_CFG = TemporalSplitConfig(
     context=CONTEXT,
     gap=GAP,
 )
+
+PATCH_SIZE = 64
+
+PATCHES_PER_SAMPLE_TRAIN = 64   # e.g. 64 patches per (tile_id, date)
+PATCHES_PER_SAMPLE_VAL = 16     # fewer for val
+PATCHES_PER_SAMPLE_TEST = 16    # fewer for test
+
+# Fraction of patches that should contain deforestation (y=1)
+POS_FRACTION_TRAIN = 0.5        # roughly 50% positive, 50% negative
+POS_FRACTION_VAL = 0.5          # you can also choose e.g. 0.3
+POS_FRACTION_TEST = 0.5
 
 
 # ------------- MAIN PIPELINE ------------- #
@@ -231,26 +245,53 @@ def build_and_save_split(
             )
             continue
 
-        fname = f"{tile_id}_{target_date.date()}.npz"
-        out_path = split_dir / fname
+        # decide #patches and pos_fraction per split
+        if split_name == "train":
+            n_patches = PATCHES_PER_SAMPLE_TRAIN
+            pos_fraction = POS_FRACTION_TRAIN
+        elif split_name == "val":
+            n_patches = PATCHES_PER_SAMPLE_VAL
+            pos_fraction = POS_FRACTION_VAL
+        else:  # "test"
+            n_patches = PATCHES_PER_SAMPLE_TEST
+            pos_fraction = POS_FRACTION_TEST
 
-        np.savez_compressed(
-            out_path,
-            X=X,
-            y=y,
-            tile_id=tile_id,
-            target_date=str(target_date.date()),
-            variables=np.array(meta["variables"], dtype=object),
-            dates=np.array([d.isoformat() for d in meta["dates"]], dtype=object),
+        # draw class-balanced random crops
+        X_patches, y_patches = balanced_random_spatial_crops(
+            X,
+            y,
+            patch_size=PATCH_SIZE,
+            n_patches=n_patches,
+            pos_fraction=pos_fraction,
         )
 
-        records.append(
-            {
-                "tile_id": tile_id,
-                "target_date": target_date,
-                "path": str(out_path),
-            }
-        )
+        # save each patch as its own .npz
+        for j in range(n_patches):
+            fname = f"{tile_id}_{target_date.date()}_patch{j:03d}.npz"
+            out_path = split_dir / fname
+
+            np.savez_compressed(
+                out_path,
+                X=X_patches[j],
+                y=y_patches[j],
+                tile_id=tile_id,
+                target_date=str(target_date.date()),
+                patch_id=j,
+                variables=np.array(meta["variables"], dtype=object),
+                dates=np.array(
+                    [d.isoformat() for d in meta["dates"]],
+                    dtype=object,
+                ),
+            )
+
+            records.append(
+                {
+                    "tile_id": tile_id,
+                    "target_date": target_date,
+                    "patch_id": j,
+                    "path": str(out_path),
+                }
+            )
 
         if (i + 1) % 50 == 0:
             print(f"    [{split_name}] processed {i+1}/{len(targets)} samples")

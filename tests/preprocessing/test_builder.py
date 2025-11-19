@@ -1,7 +1,17 @@
-from deforestation_predictor.preprocessing.builder import stack_rasters, normalize_cube_auto, build_sample
-from deforestation_predictor.preprocessing.catalog import build_gt_catalog
-from deforestation_predictor.preprocessing.catalog import build_raster_catalog, get_records_for_dates
+from deforestation_predictor.preprocessing.builder import (
+    stack_rasters,
+    normalize_cube_auto,
+    build_sample,
+    balanced_random_spatial_crops,
+)
 
+from deforestation_predictor.preprocessing.catalog import (
+    build_gt_catalog,
+    build_raster_catalog,
+    get_records_for_dates,
+)
+
+import pytest
 import numpy as np
 from datetime import datetime
 import rasterio
@@ -260,3 +270,95 @@ def test_build_sample(tmp_path):
     assert len(meta["dates"]) == 2
     assert meta["dates"][0] == datetime(2023, 8, 1)
     assert meta["dates"][1] == datetime(2023, 9, 1)
+
+
+def test_balanced_random_spatial_crops_shapes_and_balance():
+    """
+    Basic sanity check: shapes are correct and the fraction of
+    positive patches roughly matches pos_fraction.
+    """
+    rng = np.random.default_rng(0)
+
+    V, T, H, W = 2, 3, 64, 64
+    X = rng.normal(size=(V, T, H, W)).astype(np.float32)
+
+    # Make a small positive region somewhere in the middle
+    y = np.zeros((H, W), dtype=np.uint8)
+    y[20:30, 20:30] = 1
+
+    patch_size = 16
+    n_patches = 50
+    pos_fraction = 0.6
+
+    X_patches, y_patches = balanced_random_spatial_crops(
+        X,
+        y,
+        patch_size=patch_size,
+        n_patches=n_patches,
+        pos_fraction=pos_fraction,
+        rng=rng,
+    )
+
+    # Shape checks
+    assert X_patches.shape == (n_patches, V, T, patch_size, patch_size)
+    assert y_patches.shape == (n_patches, patch_size, patch_size)
+
+    # Fraction of patches that contain at least one positive pixel
+    has_pos = (y_patches > 0).any(axis=(1, 2))
+    pos_ratio = has_pos.mean()
+
+    # With n_patches=50 this should be close-ish to 0.6
+    # Allow some slack because of randomness
+    assert 0.4 <= pos_ratio <= 0.8, f"pos_ratio={pos_ratio} outside expected range"
+
+
+def test_balanced_random_spatial_crops_no_positives_all_negative():
+    """
+    When there are no positive pixels in y, all patches should be negative,
+    regardless of pos_fraction.
+    """
+    rng = np.random.default_rng(1)
+
+    V, T, H, W = 2, 2, 32, 32
+    X = rng.normal(size=(V, T, H, W)).astype(np.float32)
+    y = np.zeros((H, W), dtype=np.uint8)  # no positives at all
+
+    patch_size = 8
+    n_patches = 20
+
+    X_patches, y_patches = balanced_random_spatial_crops(
+        X,
+        y,
+        patch_size=patch_size,
+        n_patches=n_patches,
+        pos_fraction=0.9,  # ask for mostly positives, but there are none
+        rng=rng,
+    )
+
+    # Shapes still fine
+    assert X_patches.shape == (n_patches, V, T, patch_size, patch_size)
+    assert y_patches.shape == (n_patches, patch_size, patch_size)
+
+    # All patches should be zero
+    assert not (y_patches > 0).any(), "Found positive pixels in y_patches but y had no positives"
+
+
+def test_balanced_random_spatial_crops_too_large_patch_raises():
+    """
+    If the requested patch_size is larger than the spatial dimension,
+    the function should raise a ValueError.
+    """
+    rng = np.random.default_rng(2)
+
+    V, T, H, W = 1, 1, 16, 16
+    X = rng.normal(size=(V, T, H, W)).astype(np.float32)
+    y = np.zeros((H, W), dtype=np.uint8)
+
+    with pytest.raises(ValueError):
+        balanced_random_spatial_crops(
+            X,
+            y,
+            patch_size=32,   # larger than H/W
+            n_patches=5,
+            rng=rng,
+        )

@@ -211,3 +211,118 @@ def build_sample(
     }
 
     return X, y_bin, meta
+
+
+def balanced_random_spatial_crops(
+    X: np.ndarray,
+    y: np.ndarray,
+    patch_size: int,
+    n_patches: int,
+    pos_fraction: float = 0.5,
+    rng: np.random.Generator | None = None,
+    max_negative_tries: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Draw random spatial crops from a full cube, with control over the
+    proportion of patches that contain deforestation (y > 0).
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Input cube of shape [V, T, H, W].
+    y : np.ndarray
+        Binary target of shape [H, W] (0 = no deforestation, 1 = deforestation).
+    patch_size : int
+        Spatial size of each patch (e.g. 64).
+    n_patches : int
+        Total number of patches to sample.
+    pos_fraction : float
+        Approximate fraction of patches that should contain at least
+        one positive pixel (deforestation). E.g. 0.5 → ~50% positive patches.
+    rng : np.random.Generator | None
+        Optional NumPy RNG for reproducibility.
+    max_negative_tries : int
+        Maximum number of retries when trying to sample a negative patch
+        (patch with no positives).
+
+    Returns
+    -------
+    X_patches : np.ndarray
+        Shape [n_patches, V, T, patch_size, patch_size]
+    y_patches : np.ndarray
+        Shape [n_patches, patch_size, patch_size]
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    V, T, H, W = X.shape
+    ps = patch_size
+
+    if H < ps or W < ps:
+        raise ValueError(
+            f"Cannot sample {ps}x{ps} patches from cube with spatial size {H}x{W}"
+        )
+
+    X_patches = np.empty((n_patches, V, T, ps, ps), dtype=X.dtype)
+    y_patches = np.empty((n_patches, ps, ps), dtype=y.dtype)
+
+    # Coordinates of positive pixels (deforestation)
+    pos_coords = np.argwhere(y > 0)  # shape [N_pos, 2] (row, col)
+
+    max_row = H - ps
+    max_col = W - ps
+
+    def sample_positive_patch() -> tuple[int, int]:
+        """
+        Sample a patch that contains at least one positive pixel,
+        by choosing a positive pixel and placing a patch around it.
+        """
+        if pos_coords.size == 0:
+            # No positives at all in this tile → fall back to negative sampling
+            return sample_negative_patch()
+
+        r_pos, c_pos = pos_coords[rng.integers(0, len(pos_coords))]
+
+        # Choose a top-left (r0, c0) so that:
+        # - patch stays within [0, H-ps] x [0, W-ps]
+        # - (r_pos, c_pos) lies inside the patch
+        r_min = max(0, r_pos - ps + 1)
+        r_max = min(r_pos, H - ps)
+        c_min = max(0, c_pos - ps + 1)
+        c_max = min(c_pos, W - ps)
+
+        r0 = rng.integers(r_min, r_max + 1)
+        c0 = rng.integers(c_min, c_max + 1)
+
+        return int(r0), int(c0)
+
+    def sample_negative_patch() -> tuple[int, int]:
+        """
+        Sample a patch with no positive pixels (if possible).
+        """
+        for _ in range(max_negative_tries):
+            r0 = rng.integers(0, max_row + 1)
+            c0 = rng.integers(0, max_col + 1)
+
+            patch = y[r0 : r0 + ps, c0 : c0 + ps]
+            if not np.any(patch > 0):
+                return int(r0), int(c0)
+
+        # Fallback: accept whatever we get (may contain positives)
+        r0 = rng.integers(0, max_row + 1)
+        c0 = rng.integers(0, max_col + 1)
+        return int(r0), int(c0)
+
+    for i in range(n_patches):
+        # Decide whether we want a "positive" or "negative" patch
+        want_pos = rng.random() < pos_fraction
+
+        if want_pos:
+            r0, c0 = sample_positive_patch()
+        else:
+            r0, c0 = sample_negative_patch()
+
+        X_patches[i] = X[:, :, r0 : r0 + ps, c0 : c0 + ps]
+        y_patches[i] = y[r0 : r0 + ps, c0 : c0 + ps]
+
+    return X_patches, y_patches
