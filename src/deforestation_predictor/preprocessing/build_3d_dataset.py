@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-
+from pandas import DateOffset
 import numpy as np
 import pandas as pd
 
@@ -179,19 +179,13 @@ def main():
     gt_catalog = build_gt_catalog(str(GT_ROOT))
     print(f"    -> {len(gt_catalog)} GT records")
 
-    # 3) Precompute maxima for normalization
-    print("[3] Computing per-variable maxima for normalization...")
-    maxima = compute_variable_maxima(
-        full_catalog[full_catalog["variable"].isin(MONTHLY_VARS + STATIC_VARS)]
-    )
-
-    # 4) Build target table from GT
-    print("[4] Building target table from GT...")
+    # 3) Build target table from GT
+    print("[3] Building target table from GT...")
     targets = build_target_table(gt_catalog)
     print(f"    -> {len(targets)} (tile_id, date) pairs")
 
-    # 5) Filter targets to those with a full temporal window
-    print("[5] Filtering targets with full windows...")
+    # 4) Filter targets to those with a full temporal window
+    print("[4] Filtering targets with full windows...")
     targets_full = filter_targets_with_full_window(
         targets,
         catalog,
@@ -200,8 +194,8 @@ def main():
     )
     print(f"    -> {len(targets_full)} valid targets after window check")
 
-    # 6) Split into train / val / test
-    print("[6] Splitting targets into train/val/test...")
+    # 5) Split into train / val / test
+    print("[5] Splitting targets into train/val/test...")
     train_targets, val_targets, test_targets = split_targets_by_time(
         targets_full,
         SPLIT_CFG,
@@ -216,6 +210,32 @@ def main():
     train_targets.to_csv(splits_dir / "train_targets.csv", index=False)
     val_targets.to_csv(splits_dir / "val_targets.csv", index=False)
     test_targets.to_csv(splits_dir / "test_targets.csv", index=False)
+
+    # 6) Compute maxima *only from training time range* to avoid leakage
+    print("[6] Computing per-variable maxima from TRAIN catalog only...")
+
+    train_end = pd.to_datetime(SPLIT_CFG.train_end)
+
+    # Latest month that can appear in a train input window
+    max_input_date = train_end - DateOffset(months=GAP)
+
+    # Earliest month that can appear in a train input window
+    min_target_date = train_targets["date"].min()
+    min_input_date = min_target_date - DateOffset(months=CONTEXT + GAP - 1)
+
+    train_catalog_for_max = full_catalog[
+        (full_catalog["date"] >= min_input_date)
+        & (full_catalog["date"] <= max_input_date)
+        & (full_catalog["variable"].isin(MONTHLY_VARS + STATIC_VARS))
+    ].reset_index(drop=True)
+
+    print(
+        f"    -> using {len(train_catalog_for_max)} rasters for maxima "
+        f"from {min_input_date.date()} to {max_input_date.date()}"
+    )
+
+    maxima = compute_variable_maxima(train_catalog_for_max)
+
 
     # 7) Materialize samples for each split
     print("[7] Building and saving samples...")
