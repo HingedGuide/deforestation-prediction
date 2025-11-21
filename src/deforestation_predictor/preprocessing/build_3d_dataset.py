@@ -58,7 +58,6 @@ REGION_GT_ROOT = PROJECT_ROOT / "data" / "processed" / "groundtruth"
 # Where 3D dataset .npz will be written
 OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed_3d" / REGION_ID
 
-
 # Which variables you want the 3D CNN to see (snapshot / monthly)
 MONTHLY_VARS = [
     'firealerts',
@@ -127,7 +126,6 @@ PATCHES_PER_SAMPLE_TEST = 16    # fewer for test
 
 # Fraction of patches that should contain deforestation (y=1)
 POS_FRACTION_TRAIN = 0.5        # roughly 50% positive, 50% negative
-
 
 # ------------- MAIN PIPELINE ------------- #
 
@@ -317,17 +315,6 @@ def build_and_save_split(
                 f"{tile_id} @ {target_date}: {e}"
             )
             continue
-
-        # decide #patches and pos_fraction per split
-        if split_name == "train":
-            n_patches = PATCHES_PER_SAMPLE_TRAIN
-            pos_fraction = POS_FRACTION_TRAIN
-        elif split_name == "val":
-            n_patches = PATCHES_PER_SAMPLE_VAL
-            pos_fraction = POS_FRACTION_VAL
-        else:  # "test"
-            n_patches = PATCHES_PER_SAMPLE_TEST
-            pos_fraction = POS_FRACTION_TEST
 
         # decide #patches per split
         if split_name == "train":
