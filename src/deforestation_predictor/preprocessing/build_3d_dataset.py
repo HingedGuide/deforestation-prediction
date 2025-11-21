@@ -127,6 +127,9 @@ PATCHES_PER_SAMPLE_TEST = 16    # fewer for test
 # Fraction of patches that should contain deforestation (y=1)
 POS_FRACTION_TRAIN = 0.5        # roughly 50% positive, 50% negative
 
+# Threshold for forest mask (how many underlying pixels were forest)
+FOREST_MASK_THRESHOLD = 2000.0 # out of 10000
+
 # ------------- MAIN PIPELINE ------------- #
 
 def main():
@@ -164,14 +167,13 @@ def main():
 
     # Static catalog: vars we want to broadcast across time
     static_catalog = full_catalog[full_catalog["variable"].isin(STATIC_VARS)].reset_index(drop=True)
-    print("Static catalog rows:", len(static_catalog))
-    print("Static unique variables:", sorted(static_catalog["variable"].unique()))
 
-    print(
-        f"    -> {len(catalog)} input records, "
-        f"{catalog['variable'].nunique()} variables "
-        f"across {catalog['tile_id'].nunique()} tiles"
+    # forest mask catalog based on initialforestcover
+    forestmask_catalog = (
+        full_catalog[full_catalog["variable"] == "initialforestcover"]
+        .reset_index(drop=True)
     )
+    print("Forest mask records:", len(forestmask_catalog))
 
     print("[2] Building GT catalog...")
     gt_catalog = build_gt_catalog(str(GT_ROOT))
@@ -246,6 +248,8 @@ def main():
         maxima=maxima,
         output_root=output_root,
         static_catalog=static_catalog,
+        forestmask_catalog=forestmask_catalog,
+        forest_mask_threshold=FOREST_MASK_THRESHOLD,
     )
 
     build_and_save_split(
@@ -256,6 +260,8 @@ def main():
         maxima=maxima,
         output_root=output_root,
         static_catalog=static_catalog,
+        forestmask_catalog=forestmask_catalog,
+        forest_mask_threshold=FOREST_MASK_THRESHOLD,
     )
 
     build_and_save_split(
@@ -266,6 +272,8 @@ def main():
         maxima=maxima,
         output_root=output_root,
         static_catalog=static_catalog,
+        forestmask_catalog=forestmask_catalog,
+        forest_mask_threshold=FOREST_MASK_THRESHOLD,
     )
 
     print("[DONE] All samples saved.")
@@ -279,6 +287,8 @@ def build_and_save_split(
     maxima: dict[str, float],
     output_root: Path,
     static_catalog: pd.DataFrame | None = None,
+    forestmask_catalog: pd.DataFrame | None = None,
+    forest_mask_threshold: float = 0.0,
 ):
     """
     Loop over all (tile_id, date) targets in a split, build samples,
@@ -308,6 +318,8 @@ def build_and_save_split(
                 nan_policy="zero",
                 cast="float32",
                 maxima=maxima,
+                forestmask_catalog=forestmask_catalog,
+                forest_mask_threshold=forest_mask_threshold,
             )
         except Exception as e:
             print(

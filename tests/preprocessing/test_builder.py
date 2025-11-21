@@ -308,6 +308,117 @@ def test_build_sample(tmp_path):
     assert np.allclose(X[slope_idx, 1], expected_static)
 
 
+def test_build_sample_applies_forest_mask_ignore_label(tmp_path):
+    """
+    Check that build_sample uses the initialforestcover mask to set
+    an ignore_label (2) outside forest, and leaves forest pixels as
+    0/1 according to the GT.
+    """
+    data_shape = (4, 4)
+    tile_id = "00N_010E"
+
+    # Input dates for a small window: context=2, gap=1, T=2023-10-01
+    input_dates = [
+        datetime(2023, 8, 1),
+        datetime(2023, 9, 1),
+    ]
+    dyn_var = "wetlands"
+
+    # ---- Dynamic input rasters ----
+    for d in input_dates:
+        fname = f"{tile_id}_{d.date()}_{dyn_var}.tif"
+        data = np.random.randint(0, 255, size=data_shape, dtype=np.uint8)
+        with rasterio.open(
+            tmp_path / fname,
+            "w",
+            driver="GTiff",
+            height=data_shape[0],
+            width=data_shape[1],
+            count=1,
+            dtype=data.dtype,
+        ) as dst:
+            dst.write(data, 1)
+
+    # ---- GT raster for target_date ----
+    target_date = datetime(2023, 10, 1)
+    gt_fname = f"{tile_id}_{target_date.date()}_gt.tif"
+    # Binary GT (0/1) so binarization in build_sample is predictable
+    gt_data = np.array(
+        [
+            [0, 1, 0, 1],
+            [1, 0, 1, 0],
+            [0, 0, 1, 1],
+            [1, 0, 0, 1],
+        ],
+        dtype=np.uint8,
+    )
+    with rasterio.open(
+        tmp_path / gt_fname,
+        "w",
+        driver="GTiff",
+        height=data_shape[0],
+        width=data_shape[1],
+        count=1,
+        dtype=gt_data.dtype,
+    ) as dst:
+        dst.write(gt_data, 1)
+
+    # ---- Forest mask from initialforestcover ----
+    # Values > 2000 are treated as "forest" in the current implementation
+    forest_raw = np.array(
+        [
+            [2500, 1500,    0, 5000],
+            [2100, 1999, 2001,    0],
+            [   0,    0, 3000, 4000],
+            [1000, 1000, 9999, 2000],
+        ],
+        dtype=np.float32,
+    )
+    mask_fname = tmp_path / f"{tile_id}_2020-01-01_initialforestcover.tif"
+    _write_tif(mask_fname, forest_raw, dtype="float32")
+
+    # ---- Build catalogs ----
+    full_catalog = build_raster_catalog(str(tmp_path))
+    gt_catalog = build_gt_catalog(str(tmp_path))
+
+    dyn_catalog = full_catalog[full_catalog["variable"] == dyn_var].reset_index(drop=True)
+    forestmask_catalog = full_catalog[
+        full_catalog["variable"] == "initialforestcover"
+    ].reset_index(drop=True)
+
+    # ---- Call build_sample with forestmask_catalog ----
+    X, y, meta = build_sample(
+        tile_id,
+        target_date,
+        dyn_catalog,
+        gt_catalog,
+        context=2,
+        gap=1,
+        static_catalog=None,
+        normalize=False,              # we don't care about normalization here
+        maxima=None,
+        forestmask_catalog=forestmask_catalog,
+        mask_threshold=2000.0,
+    )
+
+    # Shape sanity checks
+    assert X.shape[2:] == data_shape  # H, W
+    assert y.shape == data_shape
+
+    # Expected behaviour: y == 1 where GT==1 *and* forest_raw > 2000,
+    # y == 0 where GT==0 *and* forest_raw > 2000,
+    # y == 2 (ignore_label) where forest_raw <= 2000
+    ignore_label = 2
+    forest_mask = forest_raw > 2000.0
+    expected_y = np.where(forest_mask, gt_data.astype(np.uint8), ignore_label)
+
+    assert np.array_equal(y, expected_y)
+
+    # Meta fields reflect mask usage
+    assert meta["ignore_label"] == ignore_label
+    assert meta["has_forest_mask"] is True
+
+
 def test_balanced_random_spatial_crops_shapes_and_balance():
     """
     Basic sanity check: shapes are correct and the fraction of

@@ -156,6 +156,9 @@ def build_sample(
     cast: str | None = None,
     use_cache: bool = True,
     maxima: Dict[str, float] | None = None,
+    forestmask_catalog: pd.DataFrame | None = None,
+    ignore_label: int = 2,
+    mask_threshold: float = 2000.0,
 ):
     """
     Build a single training sample for a tile and target date.
@@ -243,11 +246,39 @@ def build_sample(
     y_bin = np.zeros_like(y, dtype=np.uint8)
     y_bin[y > 0] = 1
 
+    # ---- Apply forest mask from initialforestcover, if available ----
+    if forestmask_catalog is not None and not forestmask_catalog.empty:
+        mask_rows = forestmask_catalog[forestmask_catalog["tile_id"] == tile_id]
+
+        if not mask_rows.empty:
+            # Take most recent snapshot if there are multiple dates
+            mask_rows = mask_rows.sort_values("date")
+            mask_path = mask_rows["path"].iloc[-1]
+
+            with rasterio.open(mask_path) as src:
+                forest_raw = src.read(1).astype(np.float32)
+
+            # Pixels with value > mask_threshold are treated as forest
+            forest_mask = forest_raw > mask_threshold
+
+            # Everything outside forest becomes IGNORE_LABEL
+            y_bin[~forest_mask] = ignore_label
+
+            # Optional: track this in meta
+            # (we'll add meta a few lines later)
+        else:
+            # Optional: print a warning if you expect a mask for every tile
+            print(f"[Warning] No forest mask found for tile {tile_id}")
+
     meta = {
         "tile_id": tile_id,
         "target_date": T,
         "variables": variables,
         "dates": dates,
+        "context_months": context,
+        "gap_months": gap,
+        "ignore_label": ignore_label,
+        "has_forest_mask": forestmask_catalog is not None,
     }
 
     return X, y_bin, meta
@@ -307,7 +338,8 @@ def balanced_random_spatial_crops(
     y_patches = np.empty((n_patches, ps, ps), dtype=y.dtype)
 
     # Coordinates of positive pixels (deforestation)
-    pos_coords = np.argwhere(y > 0)  # shape [N_pos, 2] (row, col)
+    # y == 1: deforestation, y == 0: no deforestation, y == 2: ignore
+    pos_coords = np.argwhere(y == 1)  # shape [N_pos, 2]
 
     max_row = H - ps
     max_col = W - ps
@@ -344,8 +376,10 @@ def balanced_random_spatial_crops(
             r0 = rng.integers(0, max_row + 1)
             c0 = rng.integers(0, max_col + 1)
 
-            patch = y[r0 : r0 + ps, c0 : c0 + ps]
-            if not np.any(patch > 0):
+            patch = y[r0: r0 + ps, c0: c0 + ps]
+            # Negative patch: no deforestation pixels (y==1).
+            # It's allowed to contain ignore pixels (y==2) – those will be masked in the loss.
+            if not np.any(patch == 1):
                 return int(r0), int(c0)
 
         # Fallback: accept whatever we get (may contain positives)
