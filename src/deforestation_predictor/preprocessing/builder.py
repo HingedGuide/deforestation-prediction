@@ -366,3 +366,42 @@ def balanced_random_spatial_crops(
         y_patches[i] = y[r0 : r0 + ps, c0 : c0 + ps]
 
     return X_patches, y_patches
+
+
+def random_spatial_crops(
+    X: np.ndarray,
+    y: np.ndarray,
+    patch_size: int,
+    n_patches: int,
+    rng: np.random.Generator | None = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Draw *unbiased* random spatial crops from a cube, no class balancing.
+    This is what we want for val/test so that label frequencies mirror reality.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    V, T, H, W = X.shape
+    ps = patch_size
+
+    if H < ps or W < ps:
+        raise ValueError(
+            f"Cannot sample {ps}x{ps} patches from cube with spatial size {H}x{W}"
+        )
+
+    X_patches = np.empty((n_patches, V, T, ps, ps), dtype=X.dtype)
+    y_patches = np.empty((n_patches, ps, ps), dtype=y.dtype)
+
+    max_row = H - ps
+    max_col = W - ps
+
+    for i in range(n_patches):
+        r0 = rng.integers(0, max_row + 1)
+        c0 = rng.integers(0, max_col + 1)
+
+        X_patches[i] = X[:, :, r0 : r0 + ps, c0 : c0 + ps]
+        y_patches[i] = y[r0 : r0 + ps, c0 : c0 + ps]
+
+    return X_patches, y_patches
+

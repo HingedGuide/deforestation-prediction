@@ -127,8 +127,6 @@ PATCHES_PER_SAMPLE_TEST = 16    # fewer for test
 
 # Fraction of patches that should contain deforestation (y=1)
 POS_FRACTION_TRAIN = 0.5        # roughly 50% positive, 50% negative
-POS_FRACTION_VAL = 0.5          # you can also choose e.g. 0.3
-POS_FRACTION_TEST = 0.5
 
 
 # ------------- MAIN PIPELINE ------------- #
@@ -311,14 +309,35 @@ def build_and_save_split(
             n_patches = PATCHES_PER_SAMPLE_TEST
             pos_fraction = POS_FRACTION_TEST
 
-        # draw class-balanced random crops
-        X_patches, y_patches = balanced_random_spatial_crops(
-            X,
-            y,
-            patch_size=PATCH_SIZE,
-            n_patches=n_patches,
-            pos_fraction=pos_fraction,
-        )
+        # decide #patches per split
+        if split_name == "train":
+            n_patches = PATCHES_PER_SAMPLE_TRAIN
+        elif split_name == "val":
+            n_patches = PATCHES_PER_SAMPLE_VAL
+        else:  # "test"
+            n_patches = PATCHES_PER_SAMPLE_TEST
+
+        if split_name == "train":
+            # TRAIN: class-balanced patches
+            X_patches, y_patches = balanced_random_spatial_crops(
+                X,
+                y,
+                patch_size=PATCH_SIZE,
+                n_patches=n_patches,
+                pos_fraction=POS_FRACTION_TRAIN,
+            )
+        else:
+            # VAL/TEST: unbiased random patches that mirror real prevalence
+            from deforestation_predictor.preprocessing.builder import (
+                random_spatial_crops,
+            )
+
+            X_patches, y_patches = random_spatial_crops(
+                X,
+                y,
+                patch_size=PATCH_SIZE,
+                n_patches=n_patches,
+            )
 
         # save each patch as its own .npz
         for j in range(n_patches):
