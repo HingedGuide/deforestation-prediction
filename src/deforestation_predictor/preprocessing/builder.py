@@ -65,6 +65,7 @@ def normalize_cube_auto(
     overflow: str = "clip",      # "clip" | "zero" | "ignore"
     cast: str | None = None,     # None | "uint8" | "float16"
     use_cache: bool = True,
+    skip_vars: set[str] | None = None,
 ) -> np.ndarray:
     """
     Normalize cube [V, T, H, W].
@@ -105,17 +106,20 @@ def normalize_cube_auto(
     Xn = X.astype(np.float32, copy=True)
 
     for i, var in enumerate(variables):
-        m = maxima.get(var, 1.0)
-        if not np.isfinite(m) or m == 0:
-            m = 1.0
+        arr = Xn[i]
 
-        arr = Xn[i] / m
+        # 1) scale by maxima unless this var is in skip_vars
+        if skip_vars is None or var not in skip_vars:
+            m = maxima.get(var, 1.0)
+            if not np.isfinite(m) or m == 0:
+                m = 1.0
+            arr = arr / m
 
-        # NaN/Inf handling
+        # 2) NaN / Inf handling
         if nan_policy == "zero":
             arr = np.where(np.isfinite(arr), arr, 0.0)
 
-        # overflow handling
+        # 3) Overflow handling
         if overflow == "clip":
             arr = np.clip(arr, 0.0, 1.0)
         elif overflow == "zero":
@@ -127,16 +131,12 @@ def normalize_cube_auto(
 
         Xn[i] = arr
 
-    # casting
+    # casting (unchanged)
     if cast == "uint8":
         Xn = np.clip(Xn, 0.0, 1.0)
         Xn = np.rint(Xn * 255.0).astype(np.uint8, copy=False)
     elif cast == "float16":
         Xn = Xn.astype(np.float16, copy=False)
-    elif cast in (None, "float32"):
-        pass
-    else:
-        raise ValueError(f"Unsupported cast={cast}")
 
     return Xn
 
@@ -158,7 +158,8 @@ def build_sample(
     maxima: Dict[str, float] | None = None,
     forestmask_catalog: pd.DataFrame | None = None,
     ignore_label: int = 2,
-    mask_threshold: float = 2000.0,
+    forest_mask_threshold: float = 2000.0,
+    categorical_vars: set[str] | None = None,
 ):
     """
     Build a single training sample for a tile and target date.
@@ -190,6 +191,7 @@ def build_sample(
             overflow=overflow,
             cast=cast,
             use_cache=use_cache,
+            skip_vars=categorical_vars,
         )
         if static_catalog is not None and not static_catalog.empty:
             static_records = static_catalog[static_catalog["tile_id"] == tile_id]
@@ -220,6 +222,7 @@ def build_sample(
                         overflow=overflow,
                         cast=None,  # keep full precision here; casting happens later if you want
                         use_cache=False,
+                        skip_vars=categorical_vars,
                     )
                     static_cube = static_cube_4d[:, 0, :, :]  # back to [V_static, H, W]
 
@@ -259,7 +262,7 @@ def build_sample(
                 forest_raw = src.read(1).astype(np.float32)
 
             # Pixels with value > mask_threshold are treated as forest
-            forest_mask = forest_raw > mask_threshold
+            forest_mask = forest_raw > forest_mask_threshold
 
             # Everything outside forest becomes IGNORE_LABEL
             y_bin[~forest_mask] = ignore_label

@@ -71,13 +71,11 @@ MONTHLY_VARS = [
     'totallossalerts',
     'previoussameseason',
     'patchdensity'
-    # extend as needed
 ]
 
 STATIC_VARS = [
     "elevation",
     "slope",
-    "wetlands",                 # if present; otherwise remove
     "peatlands",
     "initialforestcover",
     "historicloss",
@@ -100,13 +98,19 @@ STATIC_VARS = [
     "croplandcapacity100p",
     "croplandcapacitybelow50p",
     "croplandcapacityover50p",
-    "wdpa",
     "catexcap",
     "aridityannual",
     "ariditydriestquarter",
     "closenesstoforestedge",
-    # easy to add: "cattlesmoothed", "dpicoal", "dpiconvgas", ...
+    "wetlands",
+    "wdpa",
 ]
+
+# Categorical variables should not be scaled by maxima (because they are binary/categorical)
+CATEGORICAL_VARS: set[str] = {
+    'wetlands',
+    'wdpa',
+}
 
 CONTEXT = CONTEXT_MONTHS
 GAP = GAP_MONTHS
@@ -250,6 +254,7 @@ def main():
         static_catalog=static_catalog,
         forestmask_catalog=forestmask_catalog,
         forest_mask_threshold=FOREST_MASK_THRESHOLD,
+        categorical_vars=CATEGORICAL_VARS,
     )
 
     build_and_save_split(
@@ -262,6 +267,7 @@ def main():
         static_catalog=static_catalog,
         forestmask_catalog=forestmask_catalog,
         forest_mask_threshold=FOREST_MASK_THRESHOLD,
+        categorical_vars=CATEGORICAL_VARS,
     )
 
     build_and_save_split(
@@ -274,6 +280,7 @@ def main():
         static_catalog=static_catalog,
         forestmask_catalog=forestmask_catalog,
         forest_mask_threshold=FOREST_MASK_THRESHOLD,
+        categorical_vars=CATEGORICAL_VARS,
     )
 
     print("[DONE] All samples saved.")
@@ -289,6 +296,7 @@ def build_and_save_split(
     static_catalog: pd.DataFrame | None = None,
     forestmask_catalog: pd.DataFrame | None = None,
     forest_mask_threshold: float = 0.0,
+    categorical_vars: set[str] | None = None,
 ):
     """
     Loop over all (tile_id, date) targets in a split, build samples,
@@ -320,6 +328,7 @@ def build_and_save_split(
                 maxima=maxima,
                 forestmask_catalog=forestmask_catalog,
                 forest_mask_threshold=forest_mask_threshold,
+                categorical_vars=categorical_vars,
             )
         except Exception as e:
             print(

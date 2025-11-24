@@ -398,7 +398,7 @@ def test_build_sample_applies_forest_mask_ignore_label(tmp_path):
         normalize=False,              # we don't care about normalization here
         maxima=None,
         forestmask_catalog=forestmask_catalog,
-        mask_threshold=2000.0,
+        forest_mask_threshold=2000.0,
     )
 
     # Shape sanity checks
