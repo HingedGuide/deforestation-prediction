@@ -4,6 +4,8 @@ from pathlib import Path
 from pandas import DateOffset
 import numpy as np
 import pandas as pd
+import logging
+import sys
 
 from deforestation_predictor.preprocessing.catalog import (
     build_raster_catalog,
@@ -27,6 +29,19 @@ from deforestation_predictor.preprocessing.windows import (
 from deforestation_predictor.preprocessing.mosaic_and_clip_bbox import (
     mosaic_and_clip_region,
 )
+
+
+#Configuring logging
+def setup_logger(log_file):
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    return logging.getLogger(__name__)
 
 
 # ------------- CONFIG ------------- #
@@ -140,8 +155,14 @@ def main():
     output_root = Path(OUTPUT_ROOT)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    log_path = output_root / "preprocessing.log"
+    logger = setup_logger(log_path)
+
+    logger.info("Starting pipeline execution...")
+    logger.info(f"Output directory set as: {output_root}")
+
     # 0) Mosaic + clip to Gabon (idempotent enough to just run each time)
-    print("[0] Preparing mosaiced & clipped rasters for region GABON...")
+    logger.info("[0] Preparing mosaiced & clipped rasters for region GABON...")
     mosaic_and_clip_region(
         raw_input_root=RAW_INPUT_ROOT,
         raw_gt_root=RAW_GT_ROOT,
@@ -157,17 +178,17 @@ def main():
     GT_ROOT = REGION_GT_ROOT / REGION_ID
 
     # 1) Build catalogs
-    print("[1] Building input catalog (unfiltered)...")
+    logger.info("[1] Building input catalog (unfiltered)...")
     full_catalog = build_raster_catalog(str(INPUT_ROOT))
 
-    print("Raw catalog rows:", len(full_catalog))
-    print("Raw unique variables:", sorted(full_catalog["variable"].unique()))
+    logger.info(f"Raw catalog rows:", len(full_catalog))
+    logger.info(f"Raw unique variables:", sorted(full_catalog["variable"].unique()))
 
     # Dynamic (monthly) catalog: only the vars we want as time series
     catalog = full_catalog[full_catalog["variable"].isin(MONTHLY_VARS)].reset_index(drop=True)
 
-    print("Filtered catalog rows (monthly):", len(catalog))
-    print("Filtered unique monthly variables:", sorted(catalog["variable"].unique()))
+    logger.info(f"Filtered catalog rows (monthly):", len(catalog))
+    logger.info(f"Filtered unique monthly variables:", sorted(catalog["variable"].unique()))
 
     # Static catalog: vars we want to broadcast across time
     static_catalog = full_catalog[full_catalog["variable"].isin(STATIC_VARS)].reset_index(drop=True)
@@ -177,36 +198,36 @@ def main():
         full_catalog[full_catalog["variable"] == "initialforestcover"]
         .reset_index(drop=True)
     )
-    print("Forest mask records:", len(forestmask_catalog))
+    logger.info(f"Forest mask records:", len(forestmask_catalog))
 
-    print("[2] Building GT catalog...")
+    logger.info("[2] Building GT catalog...")
     gt_catalog = build_gt_catalog(str(GT_ROOT))
-    print(f"    -> {len(gt_catalog)} GT records")
+    logger.info(f"    -> {len(gt_catalog)} GT records")
 
     # 3) Build target table from GT
-    print("[3] Building target table from GT...")
+    logger.info("[3] Building target table from GT...")
     targets = build_target_table(gt_catalog)
-    print(f"    -> {len(targets)} (tile_id, date) pairs")
+    logger.info(f"    -> {len(targets)} (tile_id, date) pairs")
 
     # 4) Filter targets to those with a full temporal window
-    print("[4] Filtering targets with full windows...")
+    logger.info("[4] Filtering targets with full windows...")
     targets_full = filter_targets_with_full_window(
         targets,
         catalog,
         context=CONTEXT,
         gap=GAP,
     )
-    print(f"    -> {len(targets_full)} valid targets after window check")
+    logger.info(f"    -> {len(targets_full)} valid targets after window check")
 
     # 5) Split into train / val / test
-    print("[5] Splitting targets into train/val/test...")
+    logger.info("[5] Splitting targets into train/val/test...")
     train_targets, val_targets, test_targets = split_targets_by_time(
         targets_full,
         SPLIT_CFG,
     )
-    print(f"    train: {len(train_targets)}")
-    print(f"    val:   {len(val_targets)}")
-    print(f"    test:  {len(test_targets)}")
+    logger.info(f"    train: {len(train_targets)}")
+    logger.info(f"    val:   {len(val_targets)}")
+    logger.info(f"    test:  {len(test_targets)}")
 
     # Save split metadata as CSV
     splits_dir = output_root / "splits"
@@ -216,7 +237,7 @@ def main():
     test_targets.to_csv(splits_dir / "test_targets.csv", index=False)
 
     # 6) Compute maxima *only from training time range* to avoid leakage
-    print("[6] Computing per-variable maxima from TRAIN catalog only...")
+    logger.info("[6] Computing per-variable maxima from TRAIN catalog only...")
 
     train_end = pd.to_datetime(SPLIT_CFG.train_end)
 
@@ -233,7 +254,7 @@ def main():
         & (full_catalog["variable"].isin(MONTHLY_VARS + STATIC_VARS))
     ].reset_index(drop=True)
 
-    print(
+    logger.info(
         f"    -> using {len(train_catalog_for_max)} rasters for maxima "
         f"from {min_input_date.date()} to {max_input_date.date()}"
     )
@@ -242,7 +263,7 @@ def main():
 
 
     # 7) Materialize samples for each split
-    print("[7] Building and saving samples...")
+    logger.info("[7] Building and saving samples...")
 
     build_and_save_split(
         split_name="train",
@@ -283,7 +304,7 @@ def main():
         categorical_vars=CATEGORICAL_VARS,
     )
 
-    print("[DONE] All samples saved.")
+    logger.info("[DONE] All samples saved.")
 
 
 def build_and_save_split(
@@ -297,12 +318,16 @@ def build_and_save_split(
     forestmask_catalog: pd.DataFrame | None = None,
     forest_mask_threshold: float = 0.0,
     categorical_vars: set[str] | None = None,
+    logger=None,
 ):
     """
     Loop over all (tile_id, date) targets in a split, build samples,
     and save them as .npz files under:
         OUTPUT_ROOT / split_name / f"{tile_id}_{date}.npz"
     """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+
     split_dir = output_root / split_name
     split_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,9 +356,8 @@ def build_and_save_split(
                 categorical_vars=categorical_vars,
             )
         except Exception as e:
-            print(
-                f"[Warning] Failed to build sample for "
-                f"{tile_id} @ {target_date}: {e}"
+            logger.warning(
+                f"Failed to build sample for {tile_id} @ {target_date}: {e}"
             )
             continue
 
@@ -396,14 +420,13 @@ def build_and_save_split(
             )
 
         if (i + 1) % 50 == 0:
-            print(f"    [{split_name}] processed {i+1}/{len(targets)} samples")
+            logger.info(f"    [{split_name}] processed {i+1}/{len(targets)} samples")
 
     if records:
         index_df = pd.DataFrame(records)
         index_df.to_csv(output_root / f"{split_name}_index.csv", index=False)
-        print(
-            f"    [{split_name}] saved {len(records)} samples and "
-            f"{split_name}_index.csv"
+        logger.info(
+            f"    [{split_name}] saved {len(records)} samples and {split_name}_index.csv"
         )
 
 
