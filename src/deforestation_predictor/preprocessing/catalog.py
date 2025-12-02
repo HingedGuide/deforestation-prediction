@@ -80,7 +80,7 @@ def build_gt_catalog(gt_root: str) -> pd.DataFrame:
         var = str(info["variable"]).lower()
 
         # Accept both your real naming and the test naming
-        if var not in {"gt", "groundtruth6m", "groundtruth"}:
+        if var not in {"gt", "groundtruth6m", "groundtruth", "groundtruth3m", "groundtruth1m", "groundtruth12m"}:
             continue
 
         records.append(
