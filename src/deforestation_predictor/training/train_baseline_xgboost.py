@@ -183,5 +183,25 @@ if __name__ == "__main__":
             logger.info("Step 4: Evaluating on Test Data...")
             X_test, y_test = load_and_flatten_data("test", sample_rate=1.0, balanced=False)
 
+            # 4. Evaluate on Test
+            logger.info("Step 4: Evaluating on Test Data...")
+            X_test, y_test = load_and_flatten_data("test", sample_rate=1.0, balanced=False)
+
             if X_test is not None:
-                probs_
+                # Calculate probabilities for the positive class (class 1)
+                probs_test = model.predict_proba(X_test)[:, 1]
+
+                # Apply the optimal threshold found in the validation step
+                preds_test = (probs_test >= best_threshold).astype(int)
+
+                # Calculate final metrics
+                test_precision = precision_score(y_test, preds_test)
+                test_recall = recall_score(y_test, preds_test)
+                test_f05 = fbeta_score(y_test, preds_test, beta=0.5)
+
+                logger.info("------------- TEST RESULTS -------------")
+                logger.info(f"Test Threshold Used: {best_threshold:.4f}")
+                logger.info(f"Test F0.5 Score:    {test_f05:.4f}")
+                logger.info(f"Test Precision:     {test_precision:.4f}")
+                logger.info(f"Test Recall:        {test_recall:.4f}")
+                logger.info("----------------------------------------")
