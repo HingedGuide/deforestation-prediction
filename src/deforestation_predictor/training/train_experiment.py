@@ -7,7 +7,7 @@ from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc
 
 from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import Simple3DCNN
+from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet
 from deforestation_predictor.training.loss import FocalLoss
 from deforestation_predictor.utils.logger import setup_logger
 
@@ -94,23 +94,17 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     # RQ Parameters
     parser.add_argument("--context_months", type=int, default=12, help="Input window length (RQ2)")
-    parser.add_argument("--model_type", type=str, default="3dcnn", help="Architecture (RQ1)")
+    # Update help text to include resunet
+    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet"], help="Architecture (RQ1)")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
 
     args = parser.parse_args()
 
-    # Setup output directory
+    # ... setup logger and directories ...
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    logger.info("=" * 30)
-    logger.info(f"Starting Experiment: {args.model_type}")
-    logger.info(f"Device: {device}")
-    logger.info(f"Context Months: {args.context_months}")
-    logger.info(f"Batch Size: {args.batch_size}, LR: {args.lr}")
-    logger.info("=" * 30)
+    # ... logging info ...
 
     try:
         # 1. Load Datasets
@@ -121,7 +115,6 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
         # 2. Initialize Model
-        # Get shape from first sample to dynamically set input channels
         sample_X, _ = train_ds[0]
         in_channels = sample_X.shape[0]
         time_depth = sample_X.shape[1]
@@ -129,21 +122,26 @@ def main():
         logger.info(
             f"Input Shape detected: Channels={in_channels}, Time={time_depth}, H={sample_X.shape[2]}, W={sample_X.shape[3]}")
 
+        # --- Updated Model Selection Logic ---
         if args.model_type == "3dcnn":
             model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
+        elif args.model_type == "resunet":
+            # ResUNet handles the flattening of (Channels * Time) internally in forward()
+            # but we pass dims so it knows how many input channels to create.
+            model = ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
         logger.info(f"Model {args.model_type} initialized successfully.")
 
-        # 3. Setup Optimizer & Loss
+        # ... Optimizer, Loss, Training Loop (keep exactly as is) ...
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         criterion = FocalLoss(alpha=0.25, gamma=2.0).to(device)
 
-        # 4. Training Loop
         best_auc = 0.0
 
         for epoch in range(args.epochs):
+             # ... (keep existing loop content) ...
             logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
 
             train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -166,7 +164,6 @@ def main():
     except Exception as e:
         logger.exception("An error occurred during the experiment execution.")
         raise e
-
 
 if __name__ == "__main__":
     main()
