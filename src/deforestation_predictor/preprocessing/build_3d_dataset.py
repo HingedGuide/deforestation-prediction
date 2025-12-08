@@ -74,13 +74,14 @@ REGION_GT_ROOT = PROJECT_ROOT / "data" / "processed" / "groundtruth"
 OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed_3d" / REGION_ID
 
 # Which variables you want the 3D CNN to see (snapshot / monthly)
+# firealerts, nightlights and fw are not available for full time range
 MONTHLY_VARS = [
-    'firealerts',
-    'nightlights',
+    #'firealerts',
+    #'nightlights',
     'precipitation',
     'temperature',
     'confidence',
-    'fwi',
+    #'fwi',
     'lastmonth',
     'timesinceloss',
     'totallossalerts',
@@ -144,9 +145,13 @@ SPLIT_CFG = TemporalSplitConfig(
 )
 PATCH_SIZE = 64
 
-PATCHES_PER_SAMPLE_TRAIN = 64
-PATCHES_PER_SAMPLE_VAL = 16
-PATCHES_PER_SAMPLE_TEST = 16
+# Number of patches to extract per sample
+# I put this quite high to have more data for training
+# and also to have some overlapping patches so that the model can learn from it more robustly
+
+PATCHES_PER_SAMPLE_TRAIN = 800
+PATCHES_PER_SAMPLE_VAL = 200
+PATCHES_PER_SAMPLE_TEST = 200
 
 # Fraction of patches that should contain deforestation (y=1)
 POS_FRACTION_TRAIN = 0.5
