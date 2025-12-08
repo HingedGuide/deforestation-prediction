@@ -132,13 +132,15 @@ CONTEXT = CONTEXT_MONTHS
 GAP = GAP_MONTHS
 
 SPLIT_CFG = TemporalSplitConfig(
-    # Train: Aug 2023, Sep 2023, Oct 2023 (3 months)
-    train_end="2023-10-31",
+    # Data start: Jan 2023 -> Data end: Nov 2025
+    # Because of the 6 months of context:
+    # Train: Aug 2023 -> April 2025 (21 months)
+    train_end="2025-04-30",
 
-    # Val:   Nov 2023, Dec 2023 (2 months)
-    val_end="2023-12-31",
+    # Val: May 2025 -> July 2025 (3 months)
+    val_end="2025-07-31",
 
-    # Test:  Jan 2024 (1 month)
+    # Test:  Aug 2025 -> Nov 2025 (4 months)
     # (Implicitly covers everything after val_end)
     context=CONTEXT,
     gap=GAP,
