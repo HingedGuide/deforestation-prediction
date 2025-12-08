@@ -7,7 +7,7 @@ from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc
 
 from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet, ConvLSTM, SimpleViT3D
+from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet, ConvLSTM, ViViTSegmentation
 from deforestation_predictor.training.loss import FocalLoss
 from deforestation_predictor.utils.logger import setup_logger
 
@@ -95,7 +95,7 @@ def main():
     # RQ Parameters
     parser.add_argument("--context_months", type=int, default=12, help="Input window length (RQ2)")
     # Update help text to include resunet
-    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vit"], help="Architecture (RQ1)")
+    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit"], help="Architecture (RQ1)")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
 
     args = parser.parse_args()
@@ -133,10 +133,16 @@ def main():
             # Using the new class
             model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
 
-        elif args.model_type == "vit":
-            # ViT requires careful sizing. Assuming 64x64 patches.
-            # If your PATCH_SIZE changes, you might need to adjust parameters here.
-            model = SimpleViT3D(in_channels=in_channels, time_depth=time_depth, img_size=64).to(device)
+        elif args.model_type == "vivit":
+            # New Factorized ViViT
+            logger.info("Initializing Factorized ViViT model...")
+            model = ViViTSegmentation(
+                in_channels=in_channels,
+                time_depth=args.context_months,  # Important: Pass the max context length
+                img_size=64,  # Ensure this matches your patch size/dataset
+                patch_size=8,
+                embed_dim=128
+            ).to(device)
 
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")

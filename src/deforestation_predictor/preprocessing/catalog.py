@@ -10,7 +10,6 @@ import rasterio
 from deforestation_predictor.utils.filenames import parse_filename
 
 
-#TODO set this list based on the metadata documentation
 AGGREGATED_VARS: set[str] = {
     "lastsixmonths",
     "lastthreemonths",

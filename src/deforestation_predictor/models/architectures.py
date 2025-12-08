@@ -256,70 +256,107 @@ class ConvLSTM(nn.Module):
         return logits
 
 
-class SimpleViT3D(nn.Module):
+class ViViTSegmentation(nn.Module):
     """
-    A lightweight 3D Vision Transformer for Segmentation.
-    Uses patch embeddings and standard Transformer Encoder blocks.
+    Factorized Video Vision Transformer (ViViT) for Segmentation.
+
+    This model treats the input as a video sequence (B, C, T, H, W).
+    It uses a "Factorized Encoder" design:
+      1. Tubelet Embedding: Projects 3D patches into tokens.
+      2. Spatial Transformer: Processes spatial tokens for each frame independently.
+      3. Temporal Transformer: Processes temporal evolution for each spatial location.
+      4. Decoder: Projects the learned features back to a 2D segmentation mask.
     """
 
-    def __init__(self, in_channels, time_depth, img_size=64, patch_size=8, embed_dim=128, num_heads=4, num_layers=4,
-                 num_classes=2):
+    def __init__(self, in_channels, time_depth, img_size=64, patch_size=8, embed_dim=128,
+                 spatial_depth=4, temporal_depth=4, num_heads=4, num_classes=2):
         super().__init__()
-
         self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
         self.embed_dim = embed_dim
+        self.num_classes = num_classes
 
-        # 1. 3D Patch Embedding
-        # We treat Time as a depth dimension, but for simplicity in this baseline,
-        # we can flatten Time into Channels or use a 3D Conv with kernel=(Time, Patch, Patch)
-        # Here: Flatten Time -> Channels for "Tubelet" embedding
-        self.proj = nn.Conv2d(
-            in_channels * time_depth,
+        # 1. Tubelet Embedding (3D Convolution)
+        # We use kernel_size=(1, P, P) to treat each time step as a distinct frame of patches.
+        # This preserves the T dimension exactly as is.
+        self.tubelet_embed = nn.Conv3d(
+            in_channels,
             embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size
+            kernel_size=(1, patch_size, patch_size),
+            stride=(1, patch_size, patch_size)
         )
 
-        # 2. Positional Embedding
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        # Calculate number of spatial patches
+        self.num_patches_h = img_size // patch_size
+        self.num_patches_w = img_size // patch_size
+        self.num_spatial_tokens = self.num_patches_h * self.num_patches_w
 
-        # 3. Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Positional Embeddings
+        # Spatial: (1, 1, N_s, E) - broadcasts across Time and Batch
+        self.pos_embed_spatial = nn.Parameter(torch.zeros(1, 1, self.num_spatial_tokens, embed_dim))
+        # Temporal: (1, T, 1, E) - broadcasts across Spatial tokens and Batch
+        self.pos_embed_temporal = nn.Parameter(torch.zeros(1, time_depth, 1, embed_dim))
 
-        # 4. Decoder (Upsampling back to 64x64)
+        # 2. Spatial Transformer Encoder
+        spatial_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
+        self.spatial_transformer = nn.TransformerEncoder(spatial_layer, num_layers=spatial_depth)
+
+        # 3. Temporal Transformer Encoder
+        temporal_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
+        self.temporal_transformer = nn.TransformerEncoder(temporal_layer, num_layers=temporal_depth)
+
+        # 4. Decoder (Upsampling)
+        # Projects the aggregated features back to the original image resolution.
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(embed_dim, 64, kernel_size=patch_size, stride=patch_size),
-            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
             nn.Conv2d(32, num_classes, kernel_size=1)
         )
 
     def forward(self, x):
-        # x: [B, C, T, H, W]
+        # x shape: [Batch, C, Time, Height, Width]
         b, c, t, h, w = x.shape
 
-        # Flatten Time: [B, C*T, H, W]
-        x = x.view(b, c * t, h, w)
+        # --- A. Embedding ---
+        # [B, Embed, T, H/P, W/P]
+        x = self.tubelet_embed(x)
 
-        # Patch Embed: [B, Embed, H/P, W/P]
-        x = self.proj(x)
+        # Reshape for Transformers:
+        # We want to separate spatial and temporal dimensions.
+        # Permute to [B, T, H_p*W_p, Embed]
+        x = x.flatten(3).permute(0, 2, 3, 1)
 
-        # Flatten for Transformer: [B, Embed, NumPatches] -> [B, NumPatches, Embed]
-        x = x.flatten(2).transpose(1, 2)
+        # Add Positional Embeddings
+        # We slice pos_embed_temporal to support dynamic time lengths (RQ2) if t < max_time
+        x = x + self.pos_embed_spatial + self.pos_embed_temporal[:, :t, :, :]
 
-        # Add Positional Embedding
-        x = x + self.pos_embed
+        # --- B. Spatial Transformer ---
+        # Merge Batch and Time to process each frame's spatial tokens independently
+        # Shape: [B * T, N_spatial, Embed]
+        x_spatial = x.reshape(b * t, self.num_spatial_tokens, self.embed_dim)
+        x_spatial = self.spatial_transformer(x_spatial)
 
-        # Transformer
-        x = self.transformer(x)
+        # --- C. Temporal Transformer ---
+        # Reshape to separate Batch and Spatial, putting Time in the sequence dimension
+        # Shape: [B * N_spatial, T, Embed]
+        x_temporal = x_spatial.view(b, t, self.num_spatial_tokens, self.embed_dim).permute(0, 2, 1, 3)
+        x_temporal = x_temporal.reshape(b * self.num_spatial_tokens, t, self.embed_dim)
 
-        # Reshape back to spatial: [B, Embed, H/P, W/P]
-        h_p, w_p = h // self.patch_size, w // self.patch_size
-        x = x.transpose(1, 2).view(b, self.embed_dim, h_p, w_p)
+        x_temporal = self.temporal_transformer(x_temporal)
 
-        # Decode/Upsample
-        logits = self.decoder(x)
+        # --- D. Aggregation ---
+        # We now have spatio-temporal features. We need to collapse Time to get a single prediction map.
+        # Average Pooling over time is robust for summarizing the window.
+        # Shape: [B * N_spatial, Embed]
+        x_pooled = x_temporal.mean(dim=1)
+
+        # --- E. Decoding ---
+        # Reshape back to spatial grid: [B, Embed, H_p, W_p]
+        x_2d = x_pooled.view(b, self.num_spatial_tokens, self.embed_dim).permute(0, 2, 1)
+        x_2d = x_2d.view(b, self.embed_dim, self.num_patches_h, self.num_patches_w)
+
+        logits = self.decoder(x_2d)  # [B, NumClasses, H, W]
         return logits
