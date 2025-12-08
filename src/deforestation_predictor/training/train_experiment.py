@@ -7,7 +7,7 @@ from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc
 
 from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet
+from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet, ConvLSTM, SimpleViT3D
 from deforestation_predictor.training.loss import FocalLoss
 from deforestation_predictor.utils.logger import setup_logger
 
@@ -95,7 +95,7 @@ def main():
     # RQ Parameters
     parser.add_argument("--context_months", type=int, default=12, help="Input window length (RQ2)")
     # Update help text to include resunet
-    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet"], help="Architecture (RQ1)")
+    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vit"], help="Architecture (RQ1)")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
 
     args = parser.parse_args()
@@ -125,10 +125,19 @@ def main():
         # --- Updated Model Selection Logic ---
         if args.model_type == "3dcnn":
             model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
+
         elif args.model_type == "resunet":
-            # ResUNet handles the flattening of (Channels * Time) internally in forward()
-            # but we pass dims so it knows how many input channels to create.
             model = ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
+
+        elif args.model_type == "convlstm":
+            # Using the new class
+            model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
+
+        elif args.model_type == "vit":
+            # ViT requires careful sizing. Assuming 64x64 patches.
+            # If your PATCH_SIZE changes, you might need to adjust parameters here.
+            model = SimpleViT3D(in_channels=in_channels, time_depth=time_depth, img_size=64).to(device)
+
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 

@@ -153,4 +153,173 @@ class Simple3DCNN(nn.Module):
         logits = self.classifier(x)  # [Batch, NumClasses, H, W]
         return logits
 
-# Note: You can add a ResUNet3D or ConvLSTM class here following the same structure.
+
+class ConvLSTMCell(nn.Module):
+    """
+    A single ConvLSTM cell.
+    """
+
+    def __init__(self, in_channels, hidden_channels, kernel_size, bias):
+        super().__init__()
+        self.in_channels = in_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.bias = bias
+
+        self.conv = nn.Conv2d(
+            in_channels=self.in_channels + self.hidden_channels,
+            out_channels=4 * self.hidden_channels,
+            kernel_size=self.kernel_size,
+            padding=self.padding,
+            bias=self.bias
+        )
+
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        combined_conv = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_channels, dim=1)
+
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (torch.zeros(batch_size, self.hidden_channels, height, width, device=self.conv.weight.device),
+                torch.zeros(batch_size, self.hidden_channels, height, width, device=self.conv.weight.device))
+
+
+class ConvLSTM(nn.Module):
+    """
+    ConvLSTM Model for Spatio-Temporal Prediction.
+
+    Architecture:
+    1. Input (B, C, T, H, W) -> Unroll Time
+    2. Pass through ConvLSTM Cell at each step
+    3. Take the last Hidden State (B, Hidden, H, W)
+    4. Pass through a Decoder/Classifier to get (B, NumClasses, H, W)
+    """
+
+    def __init__(self, in_channels, time_depth, num_classes=2, hidden_dim=64, kernel_size=3):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # 1. Feature Extractor (Optional: Reduces input channels/noise before LSTM)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32)
+        )
+
+        # 2. ConvLSTM Layer
+        self.lstm_cell = ConvLSTMCell(
+            in_channels=32,
+            hidden_channels=hidden_dim,
+            kernel_size=kernel_size,
+            bias=True
+        )
+
+        # 3. Final Classifier (1x1 Conv)
+        self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # x: [Batch, Channels, Time, Height, Width]
+        b, c, t, h, w = x.shape
+
+        # Initialize hidden state
+        hidden_state = self.lstm_cell.init_hidden(b, (h, w))
+
+        # Loop over time steps
+        for step in range(t):
+            # Extract the slice for this time step: [B, C, H, W]
+            x_t = x[:, :, step, :, :]
+
+            # Encode features: [B, 32, H, W]
+            x_t_encoded = self.encoder(x_t)
+
+            # Update LSTM state
+            hidden_state = self.lstm_cell(x_t_encoded, hidden_state)
+
+        # Use the final hidden state (h_next) for prediction
+        # h_n shape: [B, Hidden, H, W]
+        final_h, _ = hidden_state
+
+        logits = self.classifier(final_h)  # [B, NumClasses, H, W]
+        return logits
+
+
+class SimpleViT3D(nn.Module):
+    """
+    A lightweight 3D Vision Transformer for Segmentation.
+    Uses patch embeddings and standard Transformer Encoder blocks.
+    """
+
+    def __init__(self, in_channels, time_depth, img_size=64, patch_size=8, embed_dim=128, num_heads=4, num_layers=4,
+                 num_classes=2):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2
+        self.embed_dim = embed_dim
+
+        # 1. 3D Patch Embedding
+        # We treat Time as a depth dimension, but for simplicity in this baseline,
+        # we can flatten Time into Channels or use a 3D Conv with kernel=(Time, Patch, Patch)
+        # Here: Flatten Time -> Channels for "Tubelet" embedding
+        self.proj = nn.Conv2d(
+            in_channels * time_depth,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size
+        )
+
+        # 2. Positional Embedding
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+
+        # 3. Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 4. Decoder (Upsampling back to 64x64)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(embed_dim, 64, kernel_size=patch_size, stride=patch_size),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        b, c, t, h, w = x.shape
+
+        # Flatten Time: [B, C*T, H, W]
+        x = x.view(b, c * t, h, w)
+
+        # Patch Embed: [B, Embed, H/P, W/P]
+        x = self.proj(x)
+
+        # Flatten for Transformer: [B, Embed, NumPatches] -> [B, NumPatches, Embed]
+        x = x.flatten(2).transpose(1, 2)
+
+        # Add Positional Embedding
+        x = x + self.pos_embed
+
+        # Transformer
+        x = self.transformer(x)
+
+        # Reshape back to spatial: [B, Embed, H/P, W/P]
+        h_p, w_p = h // self.patch_size, w // self.patch_size
+        x = x.transpose(1, 2).view(b, self.embed_dim, h_p, w_p)
+
+        # Decode/Upsample
+        logits = self.decoder(x)
+        return logits
