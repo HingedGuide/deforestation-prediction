@@ -381,9 +381,11 @@ def balanced_random_spatial_crops(
 
             patch = y[r0: r0 + ps, c0: c0 + ps]
             # Negative patch: no deforestation pixels (y==1).
-            # It's allowed to contain ignore pixels (y==2) – those will be masked in the loss.
             if not np.any(patch == 1):
-                return int(r0), int(c0)
+                continue
+
+            if np.all(patch == 2):
+                continue
 
         # Fallback: accept whatever we get (may contain positives)
         r0 = rng.integers(0, max_row + 1)
