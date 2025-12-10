@@ -1,6 +1,7 @@
 import argparse
 import torch
 import numpy as np
+import wandb
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pathlib import Path
@@ -15,17 +16,83 @@ from deforestation_predictor.utils.logger import setup_logger
 logger = setup_logger(__name__, log_file="training_experiment.log")
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def log_validation_visuals(model, loader, device, epoch, num_samples=4):
     """
-    Runs one epoch of training.
+    Logs input, ground truth, and prediction images to W&B.
+    Since inputs are 3D [C, T, H, W], we visualize the LAST time step.
+    """
+    model.eval()
+    images_to_log = []
+
+    # Get one batch
+    # We use next(iter()) which might be slow if loader is heavy, but okay for logging
+    try:
+        X, y = next(iter(loader))
+    except StopIteration:
+        return
+
+    X, y = X.to(device), y.to(device)
+
+    with torch.no_grad():
+        logits = model(X)
+        # Prob of deforestation (Class 1)
+        probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+
+    # Select a few samples from the batch
+    for i in range(min(num_samples, len(X))):
+        # 1. Extract Input (Last time step)
+        # X shape: [C, T, H, W]. We take T=-1.
+        # Assuming channel 0 is a visible band or precipitation. Adjust index if needed.
+        img_t = X[i, 0, -1, :, :].cpu().numpy()
+
+        # Normalize for display [0, 1]
+        img_min, img_max = img_t.min(), img_t.max()
+        if img_max > img_min:
+            img_t = (img_t - img_min) / (img_max - img_min)
+        else:
+            img_t = np.zeros_like(img_t)
+
+        # 2. Ground Truth
+        gt_t = y[i].cpu().numpy()
+
+        # 3. Prediction
+        pred_t = probs[i].cpu().numpy()
+
+        # Create W&B Image with masks
+        images_to_log.append(wandb.Image(
+            img_t,
+            masks={
+                "predictions": {
+                    "mask_data": (pred_t > 0.5).astype(int),
+                    "class_labels": {0: "Forest", 1: "Deforestation"}
+                },
+                "ground_truth": {
+                    # W&B expects integer masks
+                    "mask_data": gt_t.astype(int),
+                    "class_labels": {0: "Forest", 1: "Deforestation", 2: "Ignore"}
+                }
+            },
+            caption=f"Epoch {epoch} - Sample {i}"
+        ))
+
+    wandb.log({"Visual Results": images_to_log}, step=epoch)
+
+
+def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+    """
+    Runs one epoch of training, calculating Loss and PR-AUC.
     """
     model.train()
     total_loss = 0.0
 
-    # tqdm for progress bar, but we rely on logger for persistent records
+    # Lists to store predictions for PR-AUC calculation
+    all_preds = []
+    all_targets = []
+
+    # tqdm for progress bar
     pbar = tqdm(loader, desc="Training", leave=False)
 
-    for X, y in pbar:
+    for step, (X, y) in enumerate(pbar):
         X, y = X.to(device), y.to(device)
 
         optimizer.zero_grad()
@@ -35,10 +102,40 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         optimizer.step()
 
         total_loss += loss.item()
+
+        # --- Metric Collection ---
+        # We must detach to prevent memory leaks (keeping graph history)
+        with torch.no_grad():
+            # Get probabilities for class 1
+            probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+
+            # Mask ignore labels (usually 2)
+            mask = y != 2
+
+            if mask.sum() > 0:
+                all_preds.append(probs[mask].cpu().numpy())
+                all_targets.append(y[mask].cpu().numpy())
+
+        # Log batch loss to W&B frequently
+        if step % 10 == 0:
+            wandb.log({"train_batch_loss": loss.item()})
+
         pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
     avg_loss = total_loss / len(loader)
-    return avg_loss
+
+    # --- Calculate Training PR-AUC ---
+    if not all_targets:
+        train_auc = 0.0
+    else:
+        y_true = np.concatenate(all_targets)
+        y_scores = np.concatenate(all_preds)
+
+        # Calculate Precision-Recall AUC
+        precision, recall, _ = precision_recall_curve(y_true, y_scores)
+        train_auc = auc(recall, precision)
+
+    return avg_loss, train_auc
 
 
 @torch.no_grad()
@@ -94,17 +191,28 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     # RQ Parameters
     parser.add_argument("--context_months", type=int, default=12, help="Input window length (RQ2)")
-    # Update help text to include resunet
-    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit"], help="Architecture (RQ1)")
+    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit"],
+                        help="Architecture (RQ1)")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
+
+    # W&B Arguments
+    parser.add_argument("--wandb_project", type=str, default="deforestation-prediction", help="WandB Project Name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="WandB Entity")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Specific name for this run")
 
     args = parser.parse_args()
 
-    # ... setup logger and directories ...
+    # --- Initialize W&B ---
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name or f"{args.model_type}_ctx{args.context_months}",
+        config=vars(args)
+    )
+
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # ... logging info ...
 
     try:
         # 1. Load Datasets
@@ -138,8 +246,8 @@ def main():
             logger.info("Initializing Factorized ViViT model...")
             model = ViViTSegmentation(
                 in_channels=in_channels,
-                time_depth=args.context_months,  # Important: Pass the max context length
-                img_size=64,  # Ensure this matches your patch size/dataset
+                time_depth=args.context_months,
+                img_size=64,
                 patch_size=8,
                 embed_dim=128
             ).to(device)
@@ -147,26 +255,41 @@ def main():
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
+        # Watch gradients
+        wandb.watch(model, log="all", log_freq=100)
+
         logger.info(f"Model {args.model_type} initialized successfully.")
 
-        # ... Optimizer, Loss, Training Loop (keep exactly as is) ...
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
         criterion = FocalLoss(alpha=0.25, gamma=2.0).to(device)
 
         best_auc = 0.0
 
         for epoch in range(args.epochs):
-             # ... (keep existing loop content) ...
             logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
 
-            train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+            # Run Training
+            train_loss, train_auc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+
+            # Run Validation
             val_loss, val_auc = validate(model, val_loader, criterion, device)
+
+            # Log Metrics
+            wandb.log({
+                "epoch": epoch + 1,
+                "train_loss": train_loss,
+                "train_pr_auc": train_auc,
+                "val_loss": val_loss,
+                "val_pr_auc": val_auc
+            }, step=epoch + 1)
+
+            # Log Visuals
+            log_validation_visuals(model, val_loader, device, epoch + 1)
 
             logger.info(
                 f"Epoch {epoch + 1} Summary: "
-                f"Train Loss={train_loss:.4f} | "
-                f"Val Loss={val_loss:.4f} | "
-                f"Val PR-AUC={val_auc:.4f}"
+                f"Train Loss={train_loss:.4f} | Train AUC={train_auc:.4f} | "
+                f"Val Loss={val_loss:.4f} | Val AUC={val_auc:.4f}"
             )
 
             # Checkpoint saving
@@ -179,6 +302,9 @@ def main():
     except Exception as e:
         logger.exception("An error occurred during the experiment execution.")
         raise e
+    finally:
+        wandb.finish()
+
 
 if __name__ == "__main__":
     main()
