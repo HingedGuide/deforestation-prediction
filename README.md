@@ -54,11 +54,9 @@ The configuration for the pipeline (e.g. region bounds, variables, dates) can be
 Use `train_experiment.py` to train the Deep Learning models. This script integrates with Weights & Biases for experiment tracking.
 
 **Arguments:**
-<ul>
-    <li>`--model_type`: Choose from `3dcnn`, `resunet`, `convlstm` or `vivit`</li>
-    <li>`--context_months`: Choose a number of past months to use as input.</li>
-    <li>`--data_root`: Choose a path to the directory containing `train/` and `val/` `.npz` files.
-</ul>
+- `--model_type`: Choose from `3dcnn`, `resunet`, `convlstm` or `vivit`
+- `--context_months`: Choose a number of past months to use as input.
+- `--data_root`: Choose a path to the directory containing `train/` and `val/` `.npz` files.
 
 **Example Usage:**
 
