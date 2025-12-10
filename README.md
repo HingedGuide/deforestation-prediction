@@ -22,10 +22,8 @@ src/deforestation_predictor/
 ```
 
 ## Installation
-<ol>
-    <li>Clone repository</li>
-    <li>Install the required dependencies:</li>
-</ol>
+1. Clone repository
+2. Install the required dependencies:
 
 ```bash
 pip install -r requirements.txt
@@ -34,12 +32,10 @@ pip install -r requirements.txt
 The preprocessing pipeline coverts raw `input` and `groundtruth` rasters into processed `.npz` files containing 3D tensors `[Channels, Time, Height, Width]`.
 
 ### Key steps:
-<ol>
-    <li>**Mosaicing:** Merges individual tiles into a specific region (e.g. Gabon).</li>
-    <li>**Windowing:** Creates temporal windows based on a defined context length and gap.</li>
-    <li>**Normalization:** Computes maxima from the training set to normalize the inputs.</li>
-    <li>**Sampling:** Extracts balanced spatial crops (pathces) for training.</li>
-</ol>
+1. **Mosaicing:** Merges individual tiles into a specific region (e.g. Gabon).
+2. **Windowing:** Creates temporal windows based on a defined context length and gap.
+3. **Normalization:** Computes maxima from the training set to normalize the inputs.
+4. **Sampling:** Extracts balanced spatial crops (pathces) for training.
 
 To run the pipeline:
 ```bash
@@ -80,11 +76,10 @@ python -m src.deforestation_predictor.training.train_baseline_xgboost
 Note: Ensure that the `DATA_ROOT` variable inside the script points to your processed data.
 
 ## Metrics and loss
-<ul>
-    <li>**Loss function:** Focal loss is used to handle the extreme class imbalance between forest and deforestation pixels.</li>
-    <li>**Evaluation:** The primary metric is PR-AUC (Area under the Precision-Recall Curve).</li>
-    <li>**Visuals:** The training script automatically logs validation predictions (Input vs Groundtruth vs Prediction) to Weights & Biases.</li>
-</ul>
+
+- **Loss function:** Focal loss is used to handle the extreme class imbalance between forest and deforestation pixels.
+- **Evaluation:** The primary metric is PR-AUC (Area under the Precision-Recall Curve).
+- **Visuals:** The training script automatically logs validation predictions (Input vs Groundtruth vs Prediction) to Weights & Biases.
 
 ## Testing
 
