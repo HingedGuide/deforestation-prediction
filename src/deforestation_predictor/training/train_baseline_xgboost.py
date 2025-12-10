@@ -1,15 +1,17 @@
 import numpy as np
 import xgboost as xgb
 import wandb
-from wandb.integration.xgboost import WandbCallback
 from pathlib import Path
-from sklearn.metrics import precision_recall_curve, precision_score, recall_score, fbeta_score
+from sklearn.metrics import precision_recall_curve, precision_score, recall_score
 import joblib
 import logging
 import sys
 
 # ------------- CONFIG ------------- #
-DATA_ROOT = Path("data/processed/GABON/3d_dataset")
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+DATA_ROOT = PROJECT_ROOT / "data" / "processed_3d" / "GABON"
+
 IGNORE_LABEL = 2
 LOG_FILE = "xgboost_baseline.log"
 
@@ -57,11 +59,18 @@ def calculate_focal_loss(y_true, y_pred_prob, alpha=0.25, gamma=2.0):
 
 # ------------- DATA LOADING ------------- #
 def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
-    # [Use the exact same loading code from your previous file]
-    # ... (Code omitted for brevity, copy the load_and_flatten_data function from previous saved file) ...
-    # RE-INSERT FULL FUNCTION HERE IF YOU NEED ME TO WRITE IT OUT AGAIN
     split_dir = DATA_ROOT / split_name
+
     files = list(split_dir.glob("*.npz"))
+
+    # Subset for testing purposes
+    #---------------------
+    #np.random.seed(42)
+    #np.random.shuffle(files)
+
+    #files = files[:250]
+    # ---------------------
+
     X_list = []
     y_list = []
 
@@ -135,8 +144,18 @@ if __name__ == "__main__":
             X_train,
             y_train,
             eval_set=[(X_train, y_train), (X_val, y_val)],
-            callbacks=[WandbCallback()]
+            verbose=False,
         )
+
+        results = model.evals_result()
+        epochs = len(results['validation_0']['logloss'])
+        for i in range(epochs):
+            wandb.log({
+                "train_logloss": results['validation_0']['logloss'][i],
+                "val_logloss": results['validation_1']['logloss'][i],
+                "train_aucpr": results['validation_0']['aucpr'][i],
+                "val_aucpr": results['validation_1']['aucpr'][i],
+            }, step=i)
 
         # Save model
         joblib.dump(model, "xgboost_baseline.pkl")
