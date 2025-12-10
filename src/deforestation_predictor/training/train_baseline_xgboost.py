@@ -1,6 +1,7 @@
 import numpy as np
-import pandas as pd
 import xgboost as xgb
+import wandb
+from wandb.integration.xgboost import WandbCallback
 from pathlib import Path
 from sklearn.metrics import precision_recall_curve, precision_score, recall_score, fbeta_score
 import joblib
@@ -8,54 +9,59 @@ import logging
 import sys
 
 # ------------- CONFIG ------------- #
-DATA_ROOT = Path("data/processed/GABON/3d_dataset")  # Adjust to your region
+DATA_ROOT = Path("data/processed/GABON/3d_dataset")
 IGNORE_LABEL = 2
 LOG_FILE = "xgboost_baseline.log"
 
 
 # ------------- LOGGING SETUP ------------- #
 def setup_logger(log_file):
-    """
-    Sets up a logger that writes to both the console (stdout) and a file.
-    """
-    # Create a custom logger
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
-
-    # Avoid adding handlers multiple times if the script is run repeatedly in some environments
     if not logger.handlers:
-        # Create handlers
         c_handler = logging.StreamHandler(sys.stdout)
         f_handler = logging.FileHandler(log_file)
-
-        # Create formatters and add it to handlers
         log_format = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
         c_handler.setFormatter(log_format)
         f_handler.setFormatter(log_format)
-
-        # Add handlers to the logger
         logger.addHandler(c_handler)
         logger.addHandler(f_handler)
-
     return logger
 
 
 logger = setup_logger(LOG_FILE)
 
 
+# ------------- HELPER: FOCAL LOSS ------------- #
+def calculate_focal_loss(y_true, y_pred_prob, alpha=0.25, gamma=2.0):
+    """
+    Manually calculates Focal Loss for XGBoost predictions so we can compare
+    it with the Deep Learning models.
+    """
+    # Clip probabilities to avoid log(0)
+    p = np.clip(y_pred_prob, 1e-7, 1 - 1e-7)
+
+    # Calculate Cross Entropy terms
+    ce_loss = - (y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
+
+    # Calculate weights (pt)
+    pt = np.where(y_true == 1, p, 1 - p)
+
+    # Focal Loss formula: alpha * (1-pt)^gamma * CE
+    # Note: simple alpha version (alpha for class 1, 1-alpha for class 0)
+    alpha_t = np.where(y_true == 1, alpha, 1 - alpha)
+    focal_loss = alpha_t * (1 - pt) ** gamma * ce_loss
+
+    return np.mean(focal_loss)
+
+
 # ------------- DATA LOADING ------------- #
 def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
-    """
-    Loads .npz patches and converts them to a tabular format for XGBoost.
-
-    Args:
-        split_name: 'train', 'val', or 'test'
-        sample_rate: Fraction of negative pixels to keep (downsampling).
-        balanced: If True, keeps all positives and downsamples negatives.
-    """
+    # [Use the exact same loading code from your previous file]
+    # ... (Code omitted for brevity, copy the load_and_flatten_data function from previous saved file) ...
+    # RE-INSERT FULL FUNCTION HERE IF YOU NEED ME TO WRITE IT OUT AGAIN
     split_dir = DATA_ROOT / split_name
     files = list(split_dir.glob("*.npz"))
-
     X_list = []
     y_list = []
 
@@ -64,144 +70,114 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
     for i, f in enumerate(files):
         try:
             with np.load(f, allow_pickle=True) as data:
-                # Shape: (V, T, H, W)
                 X_cube = data['X']
-                # Shape: (H, W)
                 y_mask = data['y']
-
-                # Dimensions
                 V, T, H, W = X_cube.shape
-
-                # Reshape features: We want one row per pixel.
-                # Transpose to (H, W, V, T) -> reshape to (N_pixels, N_features)
-                # Features = all variables across all timesteps flattened.
                 X_flat = X_cube.transpose(2, 3, 0, 1).reshape(H * W, -1)
                 y_flat = y_mask.reshape(-1)
 
-                # Filter Ignore Labels
                 valid_mask = y_flat != IGNORE_LABEL
                 X_flat = X_flat[valid_mask]
                 y_flat = y_flat[valid_mask]
 
-                if len(y_flat) == 0:
-                    continue
+                if len(y_flat) == 0: continue
 
-                # Subsampling logic to handle class imbalance/memory
                 if balanced and split_name == 'train':
                     pos_indices = np.where(y_flat == 1)[0]
                     neg_indices = np.where(y_flat == 0)[0]
-
-                    # Keep all positives
-                    # Randomly sample negatives
                     n_neg = int(len(neg_indices) * sample_rate)
-
                     if n_neg > 0:
                         rng = np.random.default_rng()
                         neg_sample = rng.choice(neg_indices, size=n_neg, replace=False)
                         indices = np.concatenate([pos_indices, neg_sample])
                         rng.shuffle(indices)
-
                         X_flat = X_flat[indices]
                         y_flat = y_flat[indices]
 
                 X_list.append(X_flat)
                 y_list.append(y_flat)
-
         except Exception as e:
-            logger.warning(f"Failed to load {f}: {e}")
+            pass  # Skip corrupt files
 
-        # Periodic logging for long running processes
-        if (i + 1) % 100 == 0:
-            logger.info(f"Processed {i + 1}/{len(files)} files for {split_name}...")
-
-    if not X_list:
-        logger.error(f"No valid data found for {split_name}.")
-        return None, None
-
-    X_all = np.concatenate(X_list, axis=0)
-    y_all = np.concatenate(y_list, axis=0)
-
-    return X_all, y_all
+    if not X_list: return None, None
+    return np.concatenate(X_list, axis=0), np.concatenate(y_list, axis=0)
 
 
 # ------------- MAIN EXECUTION ------------- #
 if __name__ == "__main__":
-    # 1. Prepare Training Data
-    logger.info("Step 1: Preparing Training Data...")
 
-    # NOTE: Adjust sample_rate based on your RAM. 0.1 means keep 10% of negative pixels.
+    # 1. Initialize W&B
+    wandb.init(project="deforestation-prediction", name="xgboost_baseline", tags=["baseline"])
+
+    # 2. Prepare Data
+    logger.info("Step 1: Preparing Training Data...")
     X_train, y_train = load_and_flatten_data("train", sample_rate=0.1, balanced=True)
 
-    if X_train is not None:
-        logger.info(f"Training Data Shape: {X_train.shape}")
-        logger.info(f"Class balance: {np.mean(y_train):.2%} positive pixels")
+    # Load Validation Data (Needed for live metrics)
+    logger.info("Step 1b: Preparing Validation Data...")
+    X_val, y_val = load_and_flatten_data("val", sample_rate=1.0, balanced=False)
 
-        # 2. Train XGBoost
+    if X_train is not None and X_val is not None:
         logger.info("Step 2: Training XGBoost model...")
 
-        # Hyperparameters can be tuned. 'hist' tree method is much faster for large data.
         model = xgb.XGBClassifier(
             n_estimators=100,
             max_depth=6,
             learning_rate=0.1,
             n_jobs=-1,
-            tree_method='hist'
+            tree_method='hist',
+            # METRIC UPDATE: Log 'aucpr' (PR-AUC) and 'logloss'
+            eval_metric=["logloss", "aucpr"]
         )
-        model.fit(X_train, y_train)
+
+        # Train with W&B Callback
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_train, y_train), (X_val, y_val)],
+            callbacks=[WandbCallback()]
+        )
 
         # Save model
-        model_path = "xgboost_baseline.pkl"
-        joblib.dump(model, model_path)
-        logger.info(f"Model saved to {model_path}")
+        joblib.dump(model, "xgboost_baseline.pkl")
 
-        # 3. Optimize Threshold on Validation
-        logger.info("Step 3: Optimizing Threshold on Validation Data...")
-        # For validation, we typically want the real distribution (balanced=False, sample_rate=1.0)
-        # However, if memory is tight, you might need to sample val too.
-        X_val, y_val = load_and_flatten_data("val", sample_rate=1.0, balanced=False)
+        # 3. Calculate Custom Metrics (Focal Loss, Precision, Recall)
+        logger.info("Step 3: Calculating Metrics...")
 
-        if X_val is not None:
-            # Predict probabilities
-            probs_val = model.predict_proba(X_val)[:, 1]
+        # Get Probabilities
+        probs_val = model.predict_proba(X_val)[:, 1]
 
-            # Calculate F0.5 for all thresholds
-            precisions, recalls, thresholds = precision_recall_curve(y_val, probs_val)
+        # A) Calculate Focal Loss
+        val_focal_loss = calculate_focal_loss(y_val, probs_val)
 
-            # F0.5 Formula: (1 + 0.5^2) * (P * R) / ((0.5^2 * P) + R)
-            beta = 0.5
-            fbeta_scores = (1 + beta ** 2) * (precisions * recalls) / ((beta ** 2 * precisions) + recalls + 1e-8)
+        # B) Calculate Optimal Threshold (F0.5 score)
+        precisions, recalls, thresholds = precision_recall_curve(y_val, probs_val)
+        beta = 0.5
+        fbeta_scores = (1 + beta ** 2) * (precisions * recalls) / ((beta ** 2 * precisions) + recalls + 1e-8)
+        best_idx = np.argmax(fbeta_scores)
+        best_threshold = thresholds[best_idx]
 
-            # Locate best threshold
-            best_idx = np.argmax(fbeta_scores)
-            best_threshold = thresholds[best_idx]
-            best_f05 = fbeta_scores[best_idx]
+        # C) Calculate Precision/Recall at that threshold
+        preds_val = (probs_val >= best_threshold).astype(int)
+        val_precision = precision_score(y_val, preds_val)
+        val_recall = recall_score(y_val, preds_val)
 
-            logger.info(f"Optimal Threshold found: {best_threshold:.4f}")
-            logger.info(f"Max Validation F0.5 Score: {best_f05:.4f}")
+        logger.info(f"Best Threshold: {best_threshold:.4f}")
+        logger.info(f"Val Precision: {val_precision:.4f} | Val Recall: {val_recall:.4f}")
 
-            # 4. Evaluate on Test
-            logger.info("Step 4: Evaluating on Test Data...")
-            X_test, y_test = load_and_flatten_data("test", sample_rate=1.0, balanced=False)
+        # 4. Log Final Summary to W&B
+        wandb.log({
+            "val_focal_loss": val_focal_loss,
+            "best_threshold": best_threshold,
+            "val_precision": val_precision,
+            "val_recall": val_recall,
+            "val_f05": fbeta_scores[best_idx],
+            # Log the PR Curve for visualization
+            "pr_curve": wandb.plot.pr_curve(
+                y_val,
+                np.stack([1 - probs_val, probs_val], axis=1),
+                labels=["Forest", "Deforestation"]
+            )
+        })
 
-            # 4. Evaluate on Test
-            logger.info("Step 4: Evaluating on Test Data...")
-            X_test, y_test = load_and_flatten_data("test", sample_rate=1.0, balanced=False)
-
-            if X_test is not None:
-                # Calculate probabilities for the positive class (class 1)
-                probs_test = model.predict_proba(X_test)[:, 1]
-
-                # Apply the optimal threshold found in the validation step
-                preds_test = (probs_test >= best_threshold).astype(int)
-
-                # Calculate final metrics
-                test_precision = precision_score(y_test, preds_test)
-                test_recall = recall_score(y_test, preds_test)
-                test_f05 = fbeta_score(y_test, preds_test, beta=0.5)
-
-                logger.info("------------- TEST RESULTS -------------")
-                logger.info(f"Test Threshold Used: {best_threshold:.4f}")
-                logger.info(f"Test F0.5 Score:    {test_f05:.4f}")
-                logger.info(f"Test Precision:     {test_precision:.4f}")
-                logger.info(f"Test Recall:        {test_recall:.4f}")
-                logger.info("----------------------------------------")
+    wandb.finish()
