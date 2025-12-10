@@ -92,6 +92,7 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
                 if len(y_flat) == 0: continue
 
                 if balanced and split_name == 'train':
+                    # Training: Balance classes by undersampling negatives
                     pos_indices = np.where(y_flat == 1)[0]
                     neg_indices = np.where(y_flat == 0)[0]
                     n_neg = int(len(neg_indices) * sample_rate)
@@ -100,6 +101,15 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
                         neg_sample = rng.choice(neg_indices, size=n_neg, replace=False)
                         indices = np.concatenate([pos_indices, neg_sample])
                         rng.shuffle(indices)
+                        X_flat = X_flat[indices]
+                        y_flat = y_flat[indices]
+                elif sample_rate < 1.0:
+                    # Validation/Test: Randomly keep X% of ALL pixels to save memory
+                    n_keep = int(len(y_flat) * sample_rate)
+                    if n_keep > 0:
+                        rng = np.random.default_rng()
+                        indices = rng.choice(len(y_flat), size=n_keep, replace=False)
+
                         X_flat = X_flat[indices]
                         y_flat = y_flat[indices]
 
@@ -135,6 +145,7 @@ if __name__ == "__main__":
             learning_rate=0.1,
             n_jobs=-1,
             tree_method='hist',
+            device='cuda',
             # METRIC UPDATE: Log 'aucpr' (PR-AUC) and 'logloss'
             eval_metric=["logloss", "aucpr"]
         )
@@ -200,3 +211,5 @@ if __name__ == "__main__":
         })
 
     wandb.finish()
+
+# TODO: Log final summary on the TEST set, not on validation :)
