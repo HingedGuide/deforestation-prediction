@@ -59,6 +59,7 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
         return None, None
 
     files = list(split_dir.glob("*.npz"))
+
     logger.info(f"Loading {split_name} data from {len(files)} patches...")
 
     X_list = []
@@ -193,10 +194,11 @@ if __name__ == "__main__":
             preds_test = (probs_test >= best_threshold).astype(int)
             test_precision = precision_score(y_test, preds_test)
             test_recall = recall_score(y_test, preds_test)
+            test_f05 = fbeta_scores[best_idx]
 
             logger.info(f"Final Test Threshold: {best_threshold:.4f}")
-            logger.info(f"Test Precision: {test_precision:.4f} | Test Recall: {test_recall:.4f}")
-
+            logger.info(f"Test Precision: {test_precision:.4f} | Test Recall: {test_recall:.4f} | Test F0.5: {test_f05:.4f}")
+            
             wandb.log({
                 "test_focal_loss": test_focal_loss,
                 "best_threshold": best_threshold,
