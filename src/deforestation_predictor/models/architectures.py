@@ -1,7 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 
 class ResidualBlock(nn.Module):
     """
@@ -23,6 +21,49 @@ class ResidualBlock(nn.Module):
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+class ResidualBlock3D(nn.Module):
+    """
+    3D Residual Block:
+    Input -> Conv3d -> BN3d -> ReLU -> Conv3d -> BN3d -> (+ Input) -> ReLU
+    """
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        # Check if stride is an integer or tuple
+        # If integer, we apply it to spatial dims only (H, W) to preserve Time (T)
+        # unless you specifically want to downsample time.
+        if isinstance(stride, int):
+            stride_tuple = (1, stride, stride)
+        else:
+            stride_tuple = stride
+
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride_tuple, bias=False)
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(out_channels)
+
+        # Shortcut to match dimensions if stride != 1 or channels change
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=stride_tuple, bias=False),
+                nn.BatchNorm3d(out_channels)
             )
 
     def forward(self, x):
@@ -110,9 +151,90 @@ class ResUNet(nn.Module):
         return logits
 
 
+class ResUNet3D(nn.Module):
+    """
+    3D ResUNet.
+    Processes the input as a volume (B, C, T, H, W) using 3D convolutions.
+    """
+
+    def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
+        super().__init__()
+
+        # Encoder
+        # Initial block
+        self.input_layer = nn.Sequential(
+            nn.Conv3d(in_channels, filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(filters[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(filters[0]),
+            nn.ReLU(inplace=True)
+        )
+
+        # Downsampling blocks using ResidualBlock3D
+        # Stride is set to 2, which inside ResidualBlock3D maps to (1, 2, 2)
+        # to downsample H and W but preserve T.
+        self.res_down1 = ResidualBlock3D(filters[0], filters[1], stride=2)
+        self.res_down2 = ResidualBlock3D(filters[1], filters[2], stride=2)
+        self.res_down3 = ResidualBlock3D(filters[2], filters[3], stride=2)
+
+        # Bridge (Bottleneck)
+        self.bridge = ResidualBlock3D(filters[3], filters[3], stride=1)
+
+        # Decoder
+        # We use ConvTranspose3d with stride (1, 2, 2) to match the encoder's downsampling
+        self.up3 = nn.ConvTranspose3d(filters[3], filters[2], kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        self.res_up3 = ResidualBlock3D(filters[2] + filters[2], filters[2])
+
+        self.up2 = nn.ConvTranspose3d(filters[2], filters[1], kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        self.res_up2 = ResidualBlock3D(filters[1] + filters[1], filters[1])
+
+        self.up1 = nn.ConvTranspose3d(filters[1], filters[0], kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        self.res_up1 = ResidualBlock3D(filters[0] + filters[0], filters[0])
+
+        # Final Classifier
+        # Projects 3D features to classes. We still have the Time dimension here.
+        self.classifier_3d = nn.Conv3d(filters[0], num_classes, kernel_size=1)
+
+    def forward(self, x):
+        # x shape: [Batch, Channels, Time, Height, Width]
+
+        # Encoder
+        x1 = self.input_layer(x)  # [B, 32, T, H, W]
+        x2 = self.res_down1(x1)  # [B, 64, T, H/2, W/2]
+        x3 = self.res_down2(x2)  # [B, 128, T, H/4, W/4]
+        x4 = self.res_down3(x3)  # [B, 256, T, H/8, W/8]
+
+        # Bridge
+        bridge = self.bridge(x4)
+
+        # Decoder
+        up3 = self.up3(bridge)  # Upsample spatial dims
+        concat3 = torch.cat([up3, x3], dim=1)
+        dec3 = self.res_up3(concat3)
+
+        up2 = self.up2(dec3)
+        concat2 = torch.cat([up2, x2], dim=1)
+        dec2 = self.res_up2(concat2)
+
+        up1 = self.up1(dec2)
+        concat1 = torch.cat([up1, x1], dim=1)
+        dec1 = self.res_up1(concat1)
+
+        # 3D Logits: [B, NumClasses, T, H, W]
+        logits_3d = self.classifier_3d(dec1)
+
+        # Collapse Time Dimension for final 2D Prediction
+        # We can take the mean over time or the last time step.
+        # Here we use mean to aggregate temporal information.
+        logits_2d = torch.mean(logits_3d, dim=2)  # [B, NumClasses, H, W]
+
+        return logits_2d
+
+
 class Simple3DCNN(nn.Module):
     """
-    A simple 3D CNN baseline for RQ1.
+    A simple 3D CNN baseline.
     Treats time as the depth dimension (D) in (N, C, D, H, W).
     """
 
