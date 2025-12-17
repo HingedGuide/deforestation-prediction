@@ -8,7 +8,7 @@ from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc, precision_score, recall_score, fbeta_score
 
 from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import Simple3DCNN, ResUNet, ConvLSTM, ViViTSegmentation
+from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ConvLSTM3D, ViViTSegmentation
 from deforestation_predictor.training.loss import FocalLoss
 from deforestation_predictor.utils.logger import setup_logger
 
@@ -189,12 +189,12 @@ def main():
 
         logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[2]}, W={sample_X.shape[3]}")
 
-        if args.model_type == "3dcnn":
-            model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
+        if args.model_type == "resunet3d":
+            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "resunet":
             model = ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
-        elif args.model_type == "convlstm":
-            model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
+        elif args.model_type == "convlstm3d":
+            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "vivit":
             model = ViViTSegmentation(in_channels=in_channels, time_depth=args.context_months).to(device)
         else:
