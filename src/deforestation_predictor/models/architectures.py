@@ -232,50 +232,6 @@ class ResUNet3D(nn.Module):
         return logits_2d
 
 
-class Simple3DCNN(nn.Module):
-    """
-    A simple 3D CNN baseline.
-    Treats time as the depth dimension (D) in (N, C, D, H, W).
-    """
-
-    def __init__(self, in_channels, time_depth, num_classes=2):
-        super().__init__()
-
-        # Encoder
-        self.conv1 = nn.Sequential(
-            nn.Conv3d(in_channels, 32, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(32),
-            nn.ReLU()
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv3d(32, 64, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
-            nn.MaxPool3d((2, 2, 2))  # Downsample T, H, W
-        )
-
-        # Decoder (Simplified for example; in real usage, use TransposeConv or Upsample)
-        # We need to flatten Time and project back to 2D Spatial mask
-        self.final_conv = nn.Conv2d(64 * (time_depth // 2), 64, kernel_size=3, padding=1)
-        self.classifier = nn.Conv2d(64, num_classes, kernel_size=1)
-
-    def forward(self, x):
-        # x: [Batch, Channels, Time, Height, Width]
-        x = self.conv1(x)
-        x = self.conv2(x)
-
-        # Flatten Time dimension into Channels for 2D prediction
-        b, c, t, h, w = x.shape
-        x = x.view(b, c * t, h, w)
-
-        # Upsample back to original spatial size (since we pooled by 2)
-        x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-
-        x = self.final_conv(x)
-        logits = self.classifier(x)  # [Batch, NumClasses, H, W]
-        return logits
-
-
 class ConvLSTMCell(nn.Module):
     """
     A single ConvLSTM cell.
@@ -319,62 +275,117 @@ class ConvLSTMCell(nn.Module):
                 torch.zeros(batch_size, self.hidden_channels, height, width, device=self.conv.weight.device))
 
 
-class ConvLSTM(nn.Module):
+class ConvLSTM3D(nn.Module):
     """
-    ConvLSTM Model for Spatio-Temporal Prediction.
+    ResUNet with a ConvLSTM Bridge.
+    Comparable to ResUNet (2D) and ResUNet3D.
 
-    Architecture:
-    1. Input (B, C, T, H, W) -> Unroll Time
-    2. Pass through ConvLSTM Cell at each step
-    3. Take the last Hidden State (B, Hidden, H, W)
-    4. Pass through a Decoder/Classifier to get (B, NumClasses, H, W)
+    Structure:
+    1. Encoder (Shared 2D ResBlocks): Processes each frame independently.
+    2. Bridge (ConvLSTM): Processes the sequence of bottleneck features.
+    3. Decoder (2D): Upsamples the final LSTM state to the mask.
     """
 
-    def __init__(self, in_channels, time_depth, num_classes=2, hidden_dim=64, kernel_size=3):
+    def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
         super().__init__()
-        self.hidden_dim = hidden_dim
+        self.filters = filters
 
-        # 1. Feature Extractor (Optional: Reduces input channels/noise before LSTM)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(32)
+        # --- Shared Encoder (Applied to each frame) ---
+        # Note: input_dim is just 'in_channels' (e.g. 10 bands), not C*T
+        self.input_layer = nn.Sequential(
+            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(filters[0]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(filters[0]),
+            nn.ReLU(inplace=True)
         )
 
-        # 2. ConvLSTM Layer
-        self.lstm_cell = ConvLSTMCell(
-            in_channels=32,
-            hidden_channels=hidden_dim,
-            kernel_size=kernel_size,
+        self.res_down1 = ResidualBlock(filters[0], filters[1], stride=2)
+        self.res_down2 = ResidualBlock(filters[1], filters[2], stride=2)
+        self.res_down3 = ResidualBlock(filters[2], filters[3], stride=2)
+
+        # --- The Bridge: ConvLSTM ---
+        # Replaces the 2D/3D Conv Bridge.
+        # It takes the deepest features (filters[3]) and outputs the same size.
+        self.lstm_bridge = ConvLSTMCell(
+            in_channels=filters[3],
+            hidden_channels=filters[3],
+            kernel_size=3,
             bias=True
         )
 
-        # 3. Final Classifier (1x1 Conv)
-        self.classifier = nn.Conv2d(hidden_dim, num_classes, kernel_size=1)
+        # --- Decoder (Standard 2D) ---
+        self.up3 = nn.ConvTranspose2d(filters[3], filters[2], kernel_size=2, stride=2)
+        self.res_up3 = ResidualBlock(filters[2] + filters[2], filters[2])
+
+        self.up2 = nn.ConvTranspose2d(filters[2], filters[1], kernel_size=2, stride=2)
+        self.res_up2 = ResidualBlock(filters[1] + filters[1], filters[1])
+
+        self.up1 = nn.ConvTranspose2d(filters[1], filters[0], kernel_size=2, stride=2)
+        self.res_up1 = ResidualBlock(filters[0] + filters[0], filters[0])
+
+        self.classifier = nn.Conv2d(filters[0], num_classes, kernel_size=1)
 
     def forward(self, x):
-        # x: [Batch, Channels, Time, Height, Width]
+        # x shape: [Batch, Channels, Time, Height, Width]
         b, c, t, h, w = x.shape
 
+        # 1. Rearrange to process all time steps at once through the 2D Encoder
+        # Merge Batch and Time: [B*T, C, H, W]
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+
+        # --- Encoder (Time-Distributed) ---
+        # We save the features for each step, but we only strictly need the
+        # features from the LAST step for the skip connections in a standard setup.
+
+        e1 = self.input_layer(x_reshaped)  # [B*T, 32, H, W]
+        e2 = self.res_down1(e1)  # [B*T, 64, H/2, W/2]
+        e3 = self.res_down2(e2)  # [B*T, 128, H/4, W/4]
+        e4 = self.res_down3(e3)  # [B*T, 256, H/8, W/8]
+
+        # 2. Reshape back to Sequence for the LSTM Bridge
+        # [B, T, 256, H/8, W/8]
+        lstm_in = e4.view(b, t, self.filters[3], h // 8, w // 8)
+
+        # --- Bridge (ConvLSTM) ---
         # Initialize hidden state
-        hidden_state = self.lstm_cell.init_hidden(b, (h, w))
+        h_state, c_state = self.lstm_bridge.init_hidden(b, (h // 8, w // 8))
 
-        # Loop over time steps
+        # Loop through time
         for step in range(t):
-            # Extract the slice for this time step: [B, C, H, W]
-            x_t = x[:, :, step, :, :]
+            # Input: [B, 256, H/8, W/8]
+            step_input = lstm_in[:, step, :, :, :]
+            h_state, c_state = self.lstm_bridge(step_input, (h_state, c_state))
 
-            # Encode features: [B, 32, H, W]
-            x_t_encoded = self.encoder(x_t)
+        # We use the FINAL hidden state (h_state) as the bridge output
+        bridge_out = h_state  # [B, 256, H/8, W/8]
 
-            # Update LSTM state
-            hidden_state = self.lstm_cell(x_t_encoded, hidden_state)
+        # --- Decoder ---
+        # For skip connections, we use the features from the LAST time step (t-1).
+        # We extract them from the reshaped encoder outputs.
+        # e3 view: [B, T, 128, H/4, W/4] -> Take last T
 
-        # Use the final hidden state (h_next) for prediction
-        # h_n shape: [B, Hidden, H, W]
-        final_h, _ = hidden_state
+        skip3 = e3.view(b, t, self.filters[2], h // 4, w // 4)[:, -1, ...]
+        skip2 = e2.view(b, t, self.filters[1], h // 2, w // 2)[:, -1, ...]
+        skip1 = e1.view(b, t, self.filters[0], h, w)[:, -1, ...]
 
-        logits = self.classifier(final_h)  # [B, NumClasses, H, W]
+        # Up 3
+        up3 = self.up3(bridge_out)
+        concat3 = torch.cat([up3, skip3], dim=1)
+        dec3 = self.res_up3(concat3)
+
+        # Up 2
+        up2 = self.up2(dec3)
+        concat2 = torch.cat([up2, skip2], dim=1)
+        dec2 = self.res_up2(concat2)
+
+        # Up 1
+        up1 = self.up1(dec2)
+        concat1 = torch.cat([up1, skip1], dim=1)
+        dec1 = self.res_up1(concat1)
+
+        logits = self.classifier(dec1)
         return logits
 
 
