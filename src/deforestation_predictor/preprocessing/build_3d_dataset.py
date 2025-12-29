@@ -135,16 +135,21 @@ SPLIT_CFG = TemporalSplitConfig(
     # Data start: Jan 2023 -> Data end: Nov 2025
     # Because of the 6 months of context:
     # Train: Aug 2023 -> April 2025 (21 months)
-    train_end="2025-04-30",
+    train_end="2022-12-31",
 
     # Val: May 2025 -> July 2025 (3 months)
-    val_end="2025-07-31",
+    val_end="2024-06-30",
 
     # Test:  Aug 2025 -> Nov 2025 (4 months)
     # (Implicitly covers everything after val_end)
     context=CONTEXT,
     gap=GAP,
 )
+
+# Validation start date (real, after filtering)
+# First few months of validation are filtered out to prevent leakage from training period
+VAL_START_DATE_REAL = "2023-07-01"
+
 PATCH_SIZE = 64
 
 # Number of patches to extract per sample
@@ -252,10 +257,18 @@ def main():
 
     # 5) Split into train / val / test
     logger.info("[5] Splitting targets into train/val/test...")
-    train_targets, val_targets, test_targets = split_targets_by_time(
+    train_targets, val_targets_raw, test_targets = split_targets_by_time(
         targets_full,
         SPLIT_CFG,
     )
+
+    # Create a gap between train and val by removing early val targets
+    valid_start_real = pd.to_datetime(VAL_START_DATE_REAL)
+    val_targets = val_targets_raw[val_targets_raw["date"] >= valid_start_real].reset_index(drop=True)
+
+    logger.info(f"    -> Filtered out gap (Jan-Jun 2023) from validation.")
+    # --------------------------------------------------------
+
     logger.info(f"    train: {len(train_targets)}")
     logger.info(f"    val:   {len(val_targets)}")
     logger.info(f"    test:  {len(test_targets)}")
