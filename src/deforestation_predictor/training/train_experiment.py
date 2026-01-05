@@ -8,7 +8,7 @@ from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc, precision_score, recall_score, fbeta_score
 
 from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ConvLSTM3D, ViViTSegmentation
+from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
 from deforestation_predictor.training.loss import FocalLoss
 from deforestation_predictor.utils.logger import setup_logger
 
@@ -155,7 +155,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--context_months", type=int, default=12, help="Input window length")
-    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit"])
+    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit", "convlstm3d", "resunet3d"])
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
     parser.add_argument("--wandb_project", type=str, default="deforestation-prediction")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -189,14 +189,18 @@ def main():
 
         logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[2]}, W={sample_X.shape[3]}")
 
-        if args.model_type == "resunet3d":
-            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth).to(device)
+        if args.model_type == "3dcnn":
+            model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "resunet":
             model = ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
-        elif args.model_type == "convlstm3d":
-            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth).to(device)
+        elif args.model_type == "convlstm":
+            model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "vivit":
             model = ViViTSegmentation(in_channels=in_channels, time_depth=args.context_months).to(device)
+        elif args.model_type == "convlstm3d":
+            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth).to(device)
+        elif args.model_type == "resunet3d":
+            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth).to(device)
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
