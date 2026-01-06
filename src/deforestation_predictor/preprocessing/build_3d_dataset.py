@@ -129,20 +129,16 @@ CATEGORICAL_VARS: set[str] = {
 }
 
 CONTEXT = CONTEXT_MONTHS
-GAP = GAP_MONTHS
+ANCHOR_DATE = "2022-01-01"
+MAX_CONTEXT = 12
+GAP = 6  # Prediction horizon
 
 SPLIT_CFG = TemporalSplitConfig(
-    # Data start: Jan 2023 -> Data end: Nov 2025
-    # Because of the 6 months of context:
-    # Train: Aug 2023 -> April 2025 (21 months)
-    train_end="2022-12-31",
-
-    # Val: May 2025 -> July 2025 (3 months)
-    val_end="2024-06-30",
-
-    # Test:  Aug 2025 -> Nov 2025 (4 months)
-    # (Implicitly covers everything after val_end)
-    context=CONTEXT,
+    train_end="2022-12-01",  # 12 months of training
+    val_end="2023-12-01",    # 12 months of validation (contiguous)
+    test_start="2024-07-01", # 6 months gap (Jan-Jun 2024 skipped)
+    test_end="2025-06-01",   # 12 months of testing
+    context=MAX_CONTEXT,
     gap=GAP,
 )
 
@@ -231,33 +227,23 @@ def main():
         logger.error(f"Please check if GT files exist in: {GT_ROOT}")
         return
 
-    # 3) Build target table from GT
-    logger.info("[3] Building target table from GT...")
-    targets = build_target_table(gt_catalog)
-    logger.info(f"    -> {len(targets)} (tile_id, date) pairs")
+    # 3) Build target table from GT and enforce Anchor Date
+    logger.info(f"[3] Building target table (starting from {ANCHOR_DATE})...")
+    targets = build_target_table(gt_catalog, min_date=ANCHOR_DATE)
 
-    if targets.empty:
-        logger.error("CRITICAL: No valid (tile_id, date) targets found. Stopping.")
-        return
-
-    # 4) Filter targets to those with a full temporal window
-    logger.info("[4] Filtering targets with full windows...")
+    # 4) Filter targets with FULL windows based on MAX_CONTEXT
+    # This ensures consistency: all models will use the exact same pixels/dates.
+    logger.info(f"[4] Filtering targets using MAX_CONTEXT={MAX_CONTEXT}...")
     targets_full = filter_targets_with_full_window(
         targets,
         catalog,
-        context=CONTEXT,
+        context=MAX_CONTEXT,
         gap=GAP,
     )
-    logger.info(f"    -> {len(targets_full)} valid targets after window check")
 
-    if targets_full.empty:
-        logger.error("CRITICAL: No targets remained after checking for full input windows.")
-        logger.error("This means for every GT date, we are missing some input variables in the previous 12 months.")
-        return
-
-    # 5) Split into train / val / test
+    # 5) Split into train / val / test using the new logic
     logger.info("[5] Splitting targets into train/val/test...")
-    train_targets, val_targets_raw, test_targets = split_targets_by_time(
+    train_targets, val_targets, test_targets = split_targets_by_time(
         targets_full,
         SPLIT_CFG,
     )

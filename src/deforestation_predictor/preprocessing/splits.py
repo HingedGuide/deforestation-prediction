@@ -157,45 +157,44 @@ class TemporalSplitConfig:
     """
     Configuration for time-based train/val/test splits.
 
-    Dates are inclusive:
-      - train: date <= train_end
-      - val:   train_end < date <= val_end
-      - test:  date > val_end
+    This configuration ensures a continuous transition between Train and Val,
+    but enforces a gap before the Test set to account for the prediction horizon.
     """
-    train_end: str    # e.g. "2022-12-31"
-    val_end: str      # e.g. "2023-12-31"
-    context: int = CONTEXT_MONTHS
-    gap: int = GAP_MONTHS
+    train_end: str  # End of training labels (inclusive)
+    val_end: str  # End of validation labels (inclusive)
+    test_start: str  # Start of test labels (val_end + gap + 1 month)
+    test_end: str  # End of test labels (inclusive)
+    context: int
+    gap: int
 
 
 def split_targets_by_time(
-    targets: pd.DataFrame,
-    cfg: TemporalSplitConfig,
+        targets: pd.DataFrame,
+        cfg: TemporalSplitConfig,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split a target table into train/val/test subsets based on date.
-
-    Parameters
-    ----------
-    targets : DataFrame
-        Must have columns ['tile_id', 'date'].
-    cfg : TemporalSplitConfig
-        Contains train_end, val_end, and context/gap (context/gap unused here,
-        but useful for consistent configuration).
-
-    Returns
-    -------
-    (train_targets, val_targets, test_targets) : tuple of DataFrames
+    Split target table into subsets. Train/Val are contiguous.
+    Test starts after a defined gap.
     """
+    # Ensure datetime format
+    targets["date"] = pd.to_datetime(targets["date"])
     train_end = pd.to_datetime(cfg.train_end)
     val_end = pd.to_datetime(cfg.val_end)
+    test_start = pd.to_datetime(cfg.test_start)
+    test_end = pd.to_datetime(cfg.test_end)
 
-    train_mask = targets["date"] <= train_end
-    val_mask = (targets["date"] > train_end) & (targets["date"] <= val_end)
-    test_mask = targets["date"] > val_end
+    # Train: From 2022-01-01 (defined in builder) to train_end
+    train_mask = (targets["date"] >= "2022-01-01") & (targets["date"] <= train_end)
 
-    train_targets = targets[train_mask].reset_index(drop=True)
-    val_targets = targets[val_mask].reset_index(drop=True)
-    test_targets = targets[test_mask].reset_index(drop=True)
+    # Val: Starts exactly one month after train_end
+    val_start = train_end + pd.DateOffset(months=1)
+    val_mask = (targets["date"] >= val_start) & (targets["date"] <= val_end)
 
-    return train_targets, val_targets, test_targets
+    # Test: Starts after the prediction horizon gap
+    test_mask = (targets["date"] >= test_start) & (targets["date"] <= test_end)
+
+    return (
+        targets[train_mask].reset_index(drop=True),
+        targets[val_mask].reset_index(drop=True),
+        targets[test_mask].reset_index(drop=True)
+    )
