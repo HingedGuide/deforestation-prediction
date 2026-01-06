@@ -2,17 +2,21 @@ from datetime import datetime
 import pandas as pd
 from pandas import DateOffset
 
+# Default constants for the temporal window
+CONTEXT_MONTHS = 12
+GAP_MONTHS = 1
+
 
 def get_input_window_range(
         target_date: datetime | pd.Timestamp,
-        context: int,  # No default value anymore
-        gap: int,  # No default value anymore
+        context: int = CONTEXT_MONTHS,
+        gap: int = GAP_MONTHS,
 ) -> tuple[pd.Timestamp, pd.Timestamp]:
     """
     Given a target_date T, return (start, end) for the input window.
 
-    This function requires explicit context and gap to ensure
-    comparability between different model experiments.
+    The default values ensure that the preprocessing pipeline builds
+    a standard window that can be further sliced during training.
     """
     T = pd.to_datetime(target_date)
     end = T - DateOffset(months=gap)

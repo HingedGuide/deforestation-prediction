@@ -243,7 +243,7 @@ def main():
 
     # 5) Split into train / val / test using the new logic
     logger.info("[5] Splitting targets into train/val/test...")
-    train_targets, val_targets, test_targets = split_targets_by_time(
+    train_targets, val_targets_raw, test_targets = split_targets_by_time(
         targets_full,
         SPLIT_CFG,
     )
