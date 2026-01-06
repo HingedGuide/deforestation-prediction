@@ -131,7 +131,7 @@ CATEGORICAL_VARS: set[str] = {
 CONTEXT = CONTEXT_MONTHS
 ANCHOR_DATE = "2022-01-01"
 MAX_CONTEXT = 12
-GAP = 6  # Prediction horizon
+GAP = 1
 
 SPLIT_CFG = TemporalSplitConfig(
     train_end="2022-12-01",  # 12 months of training
@@ -144,7 +144,7 @@ SPLIT_CFG = TemporalSplitConfig(
 
 # Validation start date (real, after filtering)
 # First few months of validation are filtered out to prevent leakage from training period
-VAL_START_DATE_REAL = "2023-07-01"
+VAL_START_DATE_REAL = "2023-01-01"
 
 PATCH_SIZE = 64
 
