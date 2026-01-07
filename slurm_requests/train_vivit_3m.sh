@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=vivit_3m_100e
-#SBATCH --output=logs/vivit_3m_100e_%j.out
-#SBATCH --error=logs/vivit_3m_100e_%j.err
+#SBATCH --job-name=vivit_3m
+#SBATCH --output=logs/vivit_3m_%j.out
+#SBATCH --error=logs/vivit_3m_%j.err
 #SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -25,4 +25,4 @@ python src/deforestation_predictor/training/train_experiment.py \
     --batch_size 32 \
     --lr 1e-4 \
     --wandb_project "deforestation-prediction" \
-    --wandb_run_name "ViViT_3m_100e_bs32"
+    --wandb_run_name "ViViT_3m"
