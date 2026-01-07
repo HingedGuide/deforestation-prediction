@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from pandas import DateOffset
 import numpy as np
@@ -290,6 +291,10 @@ def main():
             f"from {min_input_date.date()} to {max_input_date.date()}"
         )
         maxima = compute_variable_maxima(train_catalog_for_max)
+
+        with open(output_root / "maxima.json", "w") as f:
+            json.dump(maxima, f)
+        print("Maxima saved to maxima.json")
 
     # 7) Materialize samples for each split
     logger.info("[7] Building and saving samples...")
