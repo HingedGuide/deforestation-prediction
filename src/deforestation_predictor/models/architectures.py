@@ -152,11 +152,6 @@ class ResUNet(nn.Module):
 
 
 class ResUNet3D(nn.Module):
-    """
-    3D ResUNet.
-    Processes the input as a volume (B, C, T, H, W) using 3D convolutions.
-    """
-
     def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
         super().__init__()
 
@@ -193,8 +188,12 @@ class ResUNet3D(nn.Module):
         self.res_up1 = ResidualBlock3D(filters[0] + filters[0], filters[0])
 
         # Final Classifier
-        # Projects 3D features to classes. We still have the Time dimension here.
-        self.classifier_3d = nn.Conv3d(filters[0], num_classes, kernel_size=1)
+        self.classifier_3d = nn.Conv3d(
+            filters[0], 
+            num_classes, 
+            kernel_size=(time_depth, 1, 1), 
+            padding=0
+        )
 
     def forward(self, x):
         # x shape: [Batch, Channels, Time, Height, Width]
@@ -224,10 +223,7 @@ class ResUNet3D(nn.Module):
         # 3D Logits: [B, NumClasses, T, H, W]
         logits_3d = self.classifier_3d(dec1)
 
-        # Collapse Time Dimension for final 2D Prediction
-        # We can take the mean over time or the last time step.
-        # Here we use mean to aggregate temporal information.
-        logits_2d = torch.mean(logits_3d, dim=2)  # [B, NumClasses, H, W]
+        logits_2d = logits_3d.squeeze(2)
 
         return logits_2d
 
