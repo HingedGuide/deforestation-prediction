@@ -2,7 +2,7 @@
 #SBATCH --job-name=xgboost_3m
 #SBATCH --output=logs/xgboost_3m_%j.out
 #SBATCH --error=logs/xgboost_3m_%j.err
-#SBATCH --time=06:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --gpus=1

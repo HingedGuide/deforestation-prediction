@@ -2,7 +2,7 @@
 #SBATCH --job-name=vivit_3m
 #SBATCH --output=logs/vivit_3m_%j.out
 #SBATCH --error=logs/vivit_3m_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gpus=1
