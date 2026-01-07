@@ -6,20 +6,22 @@ from sklearn.metrics import precision_recall_curve, precision_score, recall_scor
 import joblib
 import logging
 import sys
-import gc  # Garbage Collector for memory management
+import gc
+import argparse  # Toegevoegd voor command line arguments
 
 # ------------- CONFIG ------------- #
 # Calculate absolute project root relative to this script
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DATA_ROOT = PROJECT_ROOT / "data" / "processed_3d" / "GABON"
+# Default data root (kan nu overschreven worden via argumenten)
+DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "processed_3d" / "GABON"
 
 IGNORE_LABEL = 2
 LOG_FILE = "xgboost_baseline.log"
 
 # Cluster Settings
-N_ESTIMATORS = 200  # High number for production
-MAX_DEPTH = 6  # Standard depth
-VAL_TEST_SAMPLE_RATE = 0.2  # Keep 20% of Val/Test pixels to save RAM (statistically sufficient)
+N_ESTIMATORS = 200
+MAX_DEPTH = 6
+VAL_TEST_SAMPLE_RATE = 0.2
 
 
 # ------------- LOGGING SETUP ------------- #
@@ -51,8 +53,11 @@ def calculate_focal_loss(y_true, y_pred_prob, alpha=0.25, gamma=2.0):
 
 
 # ------------- DATA LOADING ------------- #
-def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
-    split_dir = DATA_ROOT / split_name
+def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=0.1, balanced=True):
+    """
+    Laadt de 3D data, past temporal slicing toe (RQ2) en flattet het naar 2D voor XGBoost.
+    """
+    split_dir = Path(data_root) / split_name
 
     if not split_dir.exists():
         logger.error(f"Directory not found: {split_dir}")
@@ -60,7 +65,7 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
 
     files = list(split_dir.glob("*.npz"))
 
-    logger.info(f"Loading {split_name} data from {len(files)} patches...")
+    logger.info(f"Loading {split_name} data from {len(files)} patches (Context: {context_length}m)...")
 
     X_list = []
     y_list = []
@@ -68,11 +73,22 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
     for f in files:
         try:
             with np.load(f, allow_pickle=True) as data:
-                X_cube = data['X']
+                X_cube = data['X']  # [Channels, Time, Height, Width]
                 y_mask = data['y']
+
+                # --- RQ2: Temporal Window Slicing ---
+                # We pakken alleen de LAATSTE 'context_length' maanden
+                current_T = X_cube.shape[1]
+                if current_T >= context_length:
+                    X_cube = X_cube[:, -context_length:, :, :]
+                else:
+                    # Dit zou niet mogen gebeuren door de preprocessing filter, maar voor de zekerheid:
+                    pass
+                
                 V, T, H, W = X_cube.shape
 
                 # Flatten [V, T, H, W] -> [Pixels, Features]
+                # Features = V * T (dus bijv. 10 vars * 3 maanden = 30 features per pixel)
                 X_flat = X_cube.transpose(2, 3, 0, 1).reshape(H * W, -1)
                 y_flat = y_mask.reshape(-1)
 
@@ -118,22 +134,47 @@ def load_and_flatten_data(split_name, sample_rate=0.1, balanced=True):
 
 # ------------- MAIN EXECUTION ------------- #
 if __name__ == "__main__":
+    
+    # Argument Parsing
+    parser = argparse.ArgumentParser(description="Train XGBoost Baseline")
+    parser.add_argument("--data_root", type=str, default=str(DEFAULT_DATA_ROOT), help="Path to processed data")
+    parser.add_argument("--context_months", type=int, default=12, help="Number of past months to use (3, 6, 12)")
+    args = parser.parse_args()
+
+    run_name = f"XGBoost_{args.context_months}m"
+    logger.info(f"Starting {run_name} using data from {args.data_root}")
 
     # 1. Initialize W&B
-    wandb.init(project="deforestation-prediction", name="xgboost_production_run", tags=["production", "gpu"])
+    wandb.init(
+        project="deforestation-prediction", 
+        name=run_name, 
+        tags=["baseline", "xgboost"],
+        config=vars(args)
+    )
 
     # 2. Load Training Data
     logger.info("Step 1: Preparing Training Data...")
-    # sample_rate=0.1 here means "Keep 10% of NEGATIVES" (Balancing)
-    X_train, y_train = load_and_flatten_data("train", sample_rate=0.1, balanced=True)
+    X_train, y_train = load_and_flatten_data(
+        args.data_root, 
+        "train", 
+        context_length=args.context_months, 
+        sample_rate=0.1, 
+        balanced=True
+    )
 
     # 3. Load Validation Data
     logger.info("Step 1b: Preparing Validation Data...")
-    # sample_rate=0.2 here means "Keep 20% of TOTAL data" (Memory saving)
-    X_val, y_val = load_and_flatten_data("val", sample_rate=VAL_TEST_SAMPLE_RATE, balanced=False)
+    X_val, y_val = load_and_flatten_data(
+        args.data_root, 
+        "val", 
+        context_length=args.context_months, 
+        sample_rate=VAL_TEST_SAMPLE_RATE, 
+        balanced=False
+    )
 
     if X_train is not None and X_val is not None:
         logger.info(f"Step 2: Training XGBoost on GPU ({X_train.shape[0]} samples)...")
+        logger.info(f"Feature count per pixel: {X_train.shape[1]} (should be Vars * {args.context_months})")
 
         model = xgb.XGBClassifier(
             n_estimators=N_ESTIMATORS,
@@ -151,7 +192,7 @@ if __name__ == "__main__":
             X_train,
             y_train,
             eval_set=[(X_train, y_train), (X_val, y_val)],
-            verbose=False  # Keep logs clean, we log to W&B manually below
+            verbose=False
         )
 
         # Log History to W&B
@@ -165,9 +206,10 @@ if __name__ == "__main__":
                 "val_aucpr": results['validation_1']['aucpr'][i],
             }, step=i)
 
-        # Save model
-        joblib.dump(model, "xgboost_production.pkl")
-        logger.info("Model saved. Cleaning memory...")
+        # Save model with context length in name
+        model_filename = f"xgboost_{args.context_months}m.pkl"
+        joblib.dump(model, model_filename)
+        logger.info(f"Model saved as {model_filename}. Cleaning memory...")
 
         # --- MEMORY CLEANUP ---
         del X_train, y_train, X_val, y_val
@@ -176,7 +218,13 @@ if __name__ == "__main__":
 
         # 4. Final Evaluation on TEST SET
         logger.info("Step 4: Loading TEST Data...")
-        X_test, y_test = load_and_flatten_data("test", sample_rate=VAL_TEST_SAMPLE_RATE, balanced=False)
+        X_test, y_test = load_and_flatten_data(
+            args.data_root, 
+            "test", 
+            context_length=args.context_months, 
+            sample_rate=VAL_TEST_SAMPLE_RATE, 
+            balanced=False
+        )
 
         if X_test is not None:
             logger.info("Calculating Final Test Metrics...")
