@@ -391,10 +391,10 @@ class ConvLSTMCell(nn.Module):
 
 class ConvLSTM3D(nn.Module):
     """
-    Hybrid Spatiotemporal Model: ResUNet Encoder + ConvLSTM Bridge + 2D Decoder.
+    Hybrid Spatiotemporal Model: 3D ResUNet Encoder + ConvLSTM Bridge + 2D Decoder.
 
     This architecture processes video data by:
-    1. Encoder (Shared 2D): Extracts spatial features from each frame independently.
+    1. Encoder (3D): Extracts spatiotemporal features directly using 3D convolutions.
     2. Bridge (ConvLSTM): Processes the sequence of spatial features to model temporal evolution.
     3. Decoder (2D): Upsamples the *final* hidden state of the LSTM to produce the prediction.
 
@@ -409,24 +409,26 @@ class ConvLSTM3D(nn.Module):
         super().__init__()
         self.filters = filters
 
-        # --- Shared Encoder (Applied to each frame) ---
-        # Note: input_dim is just 'in_channels' (e.g. 10 bands), not C*T
+        # --- 3D Encoder (Spatiotemporal) ---
+        # We use Conv3d here to capture features across time and space simultaneously.
         self.input_layer = nn.Sequential(
-            nn.Conv2d(in_channels, filters[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(filters[0]),
+            nn.Conv3d(in_channels, filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(filters[0]),
             nn.ReLU(inplace=True),
-            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(filters[0]),
+            nn.Conv3d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(filters[0]),
             nn.ReLU(inplace=True)
         )
 
-        self.res_down1 = ResidualBlock(filters[0], filters[1], stride=2)
-        self.res_down2 = ResidualBlock(filters[1], filters[2], stride=2)
-        self.res_down3 = ResidualBlock(filters[2], filters[3], stride=2)
+        # Using ResidualBlock3D with stride=2 (which maps to stride (1,2,2))
+        # This downsamples Height/Width but preserves Time (T).
+        self.res_down1 = ResidualBlock3D(filters[0], filters[1], stride=2)
+        self.res_down2 = ResidualBlock3D(filters[1], filters[2], stride=2)
+        self.res_down3 = ResidualBlock3D(filters[2], filters[3], stride=2)
 
         # --- The Bridge: ConvLSTM ---
-        # Replaces the 2D/3D Conv Bridge.
-        # It takes the deepest features (filters[3]) and outputs the same size.
+        # Takes the deepest features (filters[3]) and outputs the same size.
+        # Although the encoder is 3D, the LSTM processes the sequence step-by-step using 2D convolutions.
         self.lstm_bridge = ConvLSTMCell(
             in_channels=filters[3],
             hidden_channels=filters[3],
@@ -435,6 +437,7 @@ class ConvLSTM3D(nn.Module):
         )
 
         # --- Decoder (Standard 2D) ---
+        # The decoder remains 2D because we predict a single map based on the final state.
         self.up3 = nn.ConvTranspose2d(filters[3], filters[2], kernel_size=2, stride=2)
         self.res_up3 = ResidualBlock(filters[2] + filters[2], filters[2])
 
@@ -459,29 +462,24 @@ class ConvLSTM3D(nn.Module):
         # x shape: [Batch, Channels, Time, Height, Width]
         b, c, t, h, w = x.shape
 
-        # 1. Rearrange to process all time steps at once through the 2D Encoder
-        # Merge Batch and Time: [B*T, C, H, W]
-        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
-
-        # --- Encoder (Time-Distributed) ---
-        # We save the features for each step, but we only strictly need the
-        # features from the LAST step for the skip connections in a standard setup.
-        e1 = self.input_layer(x_reshaped)  # [B*T, 32, H, W]
-        e2 = self.res_down1(e1)  # [B*T, 64, H/2, W/2]
-        e3 = self.res_down2(e2)  # [B*T, 128, H/4, W/4]
-        e4 = self.res_down3(e3)  # [B*T, 256, H/8, W/8]
-
-        # 2. Reshape back to Sequence for the LSTM Bridge
-        # [B, T, 256, H/8, W/8]
-        lstm_in = e4.view(b, t, self.filters[3], h // 8, w // 8)
+        # --- 3D Encoder ---
+        # We pass the full 5D tensor. ResidualBlock3D preserves T.
+        e1 = self.input_layer(x)   # [B, 32, T, H, W]
+        e2 = self.res_down1(e1)    # [B, 64, T, H/2, W/2]
+        e3 = self.res_down2(e2)    # [B, 128, T, H/4, W/4]
+        e4 = self.res_down3(e3)    # [B, 256, T, H/8, W/8]
 
         # --- Bridge (ConvLSTM) ---
-        # Initialize hidden state
+        # Prepare for LSTM: [B, C, T, H', W'] -> [B, T, C, H', W']
+        # The LSTM expects to loop over the Time dimension.
+        lstm_in = e4.permute(0, 2, 1, 3, 4) 
+
+        # Initialize hidden state with the spatial dims of the deepest layer
         h_state, c_state = self.lstm_bridge.init_hidden(b, (h // 8, w // 8))
 
         # Loop through time
         for step in range(t):
-            # Input: [B, 256, H/8, W/8]
+            # Input at this step: [B, 256, H/8, W/8]
             step_input = lstm_in[:, step, :, :, :]
             h_state, c_state = self.lstm_bridge(step_input, (h_state, c_state))
 
@@ -489,13 +487,12 @@ class ConvLSTM3D(nn.Module):
         bridge_out = h_state  # [B, 256, H/8, W/8]
 
         # --- Decoder ---
-        # For skip connections, we use the features from the LAST time step (t-1).
-        # We extract them from the reshaped encoder outputs.
-        # e3 view: [B, T, 128, H/4, W/4] -> Take last T
-
-        skip3 = e3.view(b, t, self.filters[2], h // 4, w // 4)[:, -1, ...]
-        skip2 = e2.view(b, t, self.filters[1], h // 2, w // 2)[:, -1, ...]
-        skip1 = e1.view(b, t, self.filters[0], h, w)[:, -1, ...]
+        # For skip connections, we use the features from the encoder's LAST time step.
+        # e3 shape is [B, C, T, H, W], so we slice at dim=2 index -1.
+        
+        skip3 = e3[:, :, -1, :, :]  # [B, 128, H/4, W/4]
+        skip2 = e2[:, :, -1, :, :]  # [B, 64, H/2, W/2]
+        skip1 = e1[:, :, -1, :, :]  # [B, 32, H, W]
 
         # Up 3
         up3 = self.up3(bridge_out)
