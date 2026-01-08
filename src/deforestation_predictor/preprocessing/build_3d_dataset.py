@@ -253,7 +253,6 @@ def main():
     valid_start_real = pd.to_datetime(VAL_START_DATE_REAL)
     val_targets = val_targets_raw[val_targets_raw["date"] >= valid_start_real].reset_index(drop=True)
 
-    logger.info(f"    -> Filtered out gap (Jan-Jun 2023) from validation.")
     # --------------------------------------------------------
 
     logger.info(f"    train: {len(train_targets)}")
