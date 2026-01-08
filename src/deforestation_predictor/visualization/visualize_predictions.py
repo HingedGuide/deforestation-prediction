@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 # Import your project modules
 from deforestation_predictor.training.dataset import DeforestationDataset
 from deforestation_predictor.models.architectures import (
-    Simple3DCNN, ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D, ConvLSTM
+    ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
 )
 
 def get_model(model_type, in_channels, time_depth, device):
