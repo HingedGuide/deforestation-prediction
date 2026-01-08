@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gpus=1
-#SBATCH --array=0-11%2
+#SBATCH --array=0-11%3
 
 # 1. Definieer de configuraties
 configs=(
