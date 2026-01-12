@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=xgboost_6m
-#SBATCH --output=logs/xgboost_6m_%j.out
-#SBATCH --error=logs/xgboost_6m_%j.err
+#SBATCH --output=logs/xgboost_6%j.out
+#SBATCH --error=logs/xgboost_6%j.err
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
