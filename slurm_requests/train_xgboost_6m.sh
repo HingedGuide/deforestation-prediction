@@ -4,8 +4,8 @@
 #SBATCH --error=logs/xgboost_6%j.err
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
-#SBATCH --gpus=1
+#SBATCH --mem=32G
+#SBATCH --gpus=0
 
 # 1. Initialize
 eval "$(mamba shell hook --shell bash)"

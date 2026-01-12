@@ -5,3 +5,6 @@ __pycache__/
 /logs/
 /results/
 /.vscode/
+/logs_6m_horizon/
+/checkpoints/
+/checkpoints_6m_horizon/

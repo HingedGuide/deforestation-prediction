@@ -196,7 +196,7 @@ if __name__ == "__main__":
             learning_rate=0.1,
             n_jobs=-1,
             tree_method='hist',
-            device='cuda',
+            device='cpu',
             eval_metric=["logloss", "aucpr"]
         )
 
