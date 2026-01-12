@@ -12,7 +12,7 @@ from deforestation_predictor.preprocessing.catalog import build_raster_catalog, 
 from deforestation_predictor.preprocessing.builder import stack_rasters, normalize_cube_auto
 from deforestation_predictor.preprocessing.windows import get_input_window_range
 from deforestation_predictor.models.architectures import (
-    Simple3DCNN, ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D, ConvLSTMCell, ConvLSTM3D # en andere...
+    ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
 )
 
 # Hardcoded variable lists (zorg dat deze matchen met je training!)
