@@ -7,16 +7,15 @@ import joblib
 import logging
 import sys
 import gc
-import argparse  # Toegevoegd voor command line arguments
+import argparse
 
 # ------------- CONFIG ------------- #
 # Calculate absolute project root relative to this script
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-# Default data root (kan nu overschreven worden via argumenten)
+# Default data root
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data" / "processed_3d" / "GABON"
 
 IGNORE_LABEL = 2
-LOG_FILE = "xgboost_baseline.log"
 
 # Cluster Settings
 N_ESTIMATORS = 200
@@ -26,24 +25,33 @@ VAL_TEST_SAMPLE_RATE = 0.2
 
 # ------------- LOGGING SETUP ------------- #
 def setup_logger(log_file):
-    logger = logging.getLogger(__name__)
+    """
+    Configures the logger to output to both the console and a specific file.
+    """
+    logger = logging.getLogger("xgboost_baseline")
     logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        c_handler = logging.StreamHandler(sys.stdout)
-        f_handler = logging.FileHandler(log_file)
-        log_format = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-        c_handler.setFormatter(log_format)
-        f_handler.setFormatter(log_format)
-        logger.addHandler(c_handler)
-        logger.addHandler(f_handler)
+    
+    # Clear existing handlers to avoid duplicate logs when running multiple times
+    if logger.handlers:
+        logger.handlers.clear()
+
+    c_handler = logging.StreamHandler(sys.stdout)
+    f_handler = logging.FileHandler(log_file)
+    
+    log_format = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    c_handler.setFormatter(log_format)
+    f_handler.setFormatter(log_format)
+    
+    logger.addHandler(c_handler)
+    logger.addHandler(f_handler)
     return logger
-
-
-logger = setup_logger(LOG_FILE)
 
 
 # ------------- HELPER: FOCAL LOSS ------------- #
 def calculate_focal_loss(y_true, y_pred_prob, alpha=0.25, gamma=2.0):
+    """
+    Calculates the focal loss for binary classification.
+    """
     p = np.clip(y_pred_prob, 1e-7, 1 - 1e-7)
     ce_loss = - (y_true * np.log(p) + (1 - y_true) * np.log(1 - p))
     pt = np.where(y_true == 1, p, 1 - p)
@@ -55,8 +63,9 @@ def calculate_focal_loss(y_true, y_pred_prob, alpha=0.25, gamma=2.0):
 # ------------- DATA LOADING ------------- #
 def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=0.1, balanced=True):
     """
-    Laadt de 3D data, past temporal slicing toe (RQ2) en flattet het naar 2D voor XGBoost.
+    Loads 3D patch data, applies temporal slicing (RQ2), and flattens to 2D for XGBoost.
     """
+    logger = logging.getLogger("xgboost_baseline")
     split_dir = Path(data_root) / split_name
 
     if not split_dir.exists():
@@ -64,7 +73,6 @@ def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=
         return None, None
 
     files = list(split_dir.glob("*.npz"))
-
     logger.info(f"Loading {split_name} data from {len(files)} patches (Context: {context_length}m)...")
 
     X_list = []
@@ -77,18 +85,15 @@ def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=
                 y_mask = data['y']
 
                 # --- RQ2: Temporal Window Slicing ---
-                # We pakken alleen de LAATSTE 'context_length' maanden
+                # Take only the LAST 'context_length' months
                 current_T = X_cube.shape[1]
                 if current_T >= context_length:
                     X_cube = X_cube[:, -context_length:, :, :]
-                else:
-                    # Dit zou niet mogen gebeuren door de preprocessing filter, maar voor de zekerheid:
-                    pass
                 
                 V, T, H, W = X_cube.shape
 
                 # Flatten [V, T, H, W] -> [Pixels, Features]
-                # Features = V * T (dus bijv. 10 vars * 3 maanden = 30 features per pixel)
+                # Features = V * T (e.g., 10 variables * 3 months = 30 features per pixel)
                 X_flat = X_cube.transpose(2, 3, 0, 1).reshape(H * W, -1)
                 y_flat = y_mask.reshape(-1)
 
@@ -102,7 +107,7 @@ def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=
                 rng = np.random.default_rng()
 
                 if balanced and split_name == 'train':
-                    # TRAINING: Keep all positives, downsample negatives to 1:10 ratio
+                    # TRAINING: Downsample negatives to balance classes (keep all positives)
                     pos_indices = np.where(y_flat == 1)[0]
                     neg_indices = np.where(y_flat == 0)[0]
                     n_neg = int(len(neg_indices) * sample_rate)
@@ -121,11 +126,11 @@ def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=
                         indices = rng.choice(len(y_flat), size=n_keep, replace=False)
                         X_flat = X_flat[indices]
                         y_flat = y_flat[indices]
-                # ----------------------
 
                 X_list.append(X_flat)
                 y_list.append(y_flat)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error loading {f.name}: {e}")
             pass
 
     if not X_list: return None, None
@@ -135,16 +140,25 @@ def load_and_flatten_data(data_root, split_name, context_length=12, sample_rate=
 # ------------- MAIN EXECUTION ------------- #
 if __name__ == "__main__":
     
-    # Argument Parsing
+    # 1. Argument Parsing
     parser = argparse.ArgumentParser(description="Train XGBoost Baseline")
     parser.add_argument("--data_root", type=str, default=str(DEFAULT_DATA_ROOT), help="Path to processed data")
     parser.add_argument("--context_months", type=int, default=12, help="Number of past months to use (3, 6, 12)")
     args = parser.parse_args()
 
+    # 2. Setup Dynamic Logging
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set dynamic log file name
+    log_file_path = log_dir / f"xgboost_{args.context_months}m.log"
+    logger = setup_logger(str(log_file_path))
+
     run_name = f"XGBoost_{args.context_months}m"
     logger.info(f"Starting {run_name} using data from {args.data_root}")
 
-    # 1. Initialize W&B
+    # 3. Initialize W&B
     wandb.init(
         project="deforestation-prediction", 
         name=run_name, 
@@ -152,7 +166,7 @@ if __name__ == "__main__":
         config=vars(args)
     )
 
-    # 2. Load Training Data
+    # 4. Load Training Data
     logger.info("Step 1: Preparing Training Data...")
     X_train, y_train = load_and_flatten_data(
         args.data_root, 
@@ -162,7 +176,7 @@ if __name__ == "__main__":
         balanced=True
     )
 
-    # 3. Load Validation Data
+    # 5. Load Validation Data
     logger.info("Step 1b: Preparing Validation Data...")
     X_val, y_val = load_and_flatten_data(
         args.data_root, 
@@ -174,17 +188,15 @@ if __name__ == "__main__":
 
     if X_train is not None and X_val is not None:
         logger.info(f"Step 2: Training XGBoost on GPU ({X_train.shape[0]} samples)...")
-        logger.info(f"Feature count per pixel: {X_train.shape[1]} (should be Vars * {args.context_months})")
+        logger.info(f"Feature count per pixel: {X_train.shape[1]}")
 
         model = xgb.XGBClassifier(
             n_estimators=N_ESTIMATORS,
             max_depth=MAX_DEPTH,
             learning_rate=0.1,
             n_jobs=-1,
-            # --- GPU & Performance ---
             tree_method='hist',
             device='cuda',
-            # -------------------------
             eval_metric=["logloss", "aucpr"]
         )
 
@@ -214,9 +226,8 @@ if __name__ == "__main__":
         # --- MEMORY CLEANUP ---
         del X_train, y_train, X_val, y_val
         gc.collect()
-        # ----------------------
 
-        # 4. Final Evaluation on TEST SET
+        # 6. Final Evaluation on TEST SET
         logger.info("Step 4: Loading TEST Data...")
         X_test, y_test = load_and_flatten_data(
             args.data_root, 
@@ -252,7 +263,7 @@ if __name__ == "__main__":
                 "best_threshold": best_threshold,
                 "test_precision": test_precision,
                 "test_recall": test_recall,
-                "test_f05": fbeta_scores[best_idx],
+                "test_f05": test_f05,
                 "test_pr_curve": wandb.plot.pr_curve(
                     y_test,
                     np.stack([1 - probs_test, probs_test], axis=1),
