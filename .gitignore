@@ -8,3 +8,4 @@ __pycache__/
 /logs_6m_horizon/
 /checkpoints/
 /checkpoints_6m_horizon/
+/data_6m/

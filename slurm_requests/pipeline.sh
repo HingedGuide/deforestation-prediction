@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=deforestation_experiment_full
-#SBATCH --output=logs/slurm_startup_%A_%a.out  # Vangt alleen opstartfouten op
+#SBATCH --output=logs/slurm_startup_%A_%a.out  # Captures only startup errors
 #SBATCH --error=logs/slurm_startup_%A_%a.err
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=4
@@ -8,7 +8,7 @@
 #SBATCH --gpus=1
 #SBATCH --array=0-11%3
 
-# 1. Definieer de configuraties
+# 1. Define the configurations
 configs=(
     "resunet 3"
     "resunet 6"
@@ -24,25 +24,24 @@ configs=(
     "vivit 12"
 )
 
-# 2. Bepaal welk model we gaan draaien
+# 2. Determine which model to run
 current_config=${configs[$SLURM_ARRAY_TASK_ID]}
 read -r MODEL_TYPE CONTEXT_MONTHS <<< "$current_config"
 
-# --- HIER GEBEURT DE MAGIE ---
-# We leiden nu alle output (stdout en stderr) om naar uw gewenste bestandsnaam.
-# Formaat: logs/model_maanden.out
+# We now redirect all output (stdout and stderr) to desired filename.
+# Format: logs/model_months.out
 LOG_FILE="logs/${MODEL_TYPE}_${CONTEXT_MONTHS}"
 
-echo "Output wordt vanaf nu weggeschreven naar: ${LOG_FILE}.out"
+echo "Output will be written to: ${LOG_FILE}.out from now on"
 
-# Redirect stdout (1) en stderr (2) naar de nieuwe bestanden
+# Redirect stdout (1) and stderr (2) to the new files
 exec > "${LOG_FILE}.out" 2> "${LOG_FILE}.err"
 
-# Vanaf hier komt alles in uw specifieke logbestand terecht
+# From here on, everything goes into specific log file
 echo "Starting task ${SLURM_ARRAY_TASK_ID}: Model=${MODEL_TYPE}, Context=${CONTEXT_MONTHS}m"
 date
 
-# 3. Initialize environment (nu pas, zodat output ook in de juiste log komt)
+# 3. Initialize environment (only now, so output also goes to the correct log)
 eval "$(mamba shell hook --shell bash)"
 mamba activate ties_env
 

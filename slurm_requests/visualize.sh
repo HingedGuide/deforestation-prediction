@@ -14,7 +14,7 @@ mamba activate ties_env
 cd ~/DL_Deforestation_Prediction
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
 
-# Voorbeeld: Visualiseer ResUNet (12 maanden)
+# Example: Visualize ResUNet (12 months)
 python src/deforestation_predictor/visualization/visualize_predictions.py \
     --data_root ~/DL_Deforestation_Prediction/data/processed_3d/GABON \
     --checkpoint checkpoints/ResUNet_12m_best.pth \
