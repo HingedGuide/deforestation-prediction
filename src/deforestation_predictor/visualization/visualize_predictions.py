@@ -15,12 +15,8 @@ def get_model(model_type, in_channels, time_depth, device):
     """
     Factory function to initialize the model architecture based on the type name.
     """
-    if model_type == "3dcnn":
-        return Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
-    elif model_type == "resunet":
+    if model_type == "resunet":
         return ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
-    elif model_type == "convlstm":
-        return ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
     elif model_type == "vivit":
         return ViViTSegmentation(in_channels=in_channels, time_depth=time_depth).to(device)
     elif model_type == "convlstm3d":

@@ -15,7 +15,7 @@ from deforestation_predictor.models.architectures import (
     ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
 )
 
-# Hardcoded variable lists (zorg dat deze matchen met je training!)
+# Hardcoded variable lists (ensure these match training!)
 MONTHLY_VARS = [
     'precipitation', 'temperature', 'confidence', 'lastmonth', 
     'timesinceloss', 'totallossalerts', 'previoussameseason', 'patchdensity'
@@ -33,7 +33,7 @@ STATIC_VARS = [
 ]
 
 def get_model(model_type, in_channels, time_depth, device):
-    # Dezelfde factory functie als eerder
+    # Same factory function as before
     if model_type == "resunet":
         return ResUNet(in_channels, time_depth).to(device)
     elif model_type == "resunet3d":
@@ -46,7 +46,7 @@ def get_model(model_type, in_channels, time_depth, device):
         raise ValueError(f"Model {model_type} not supported in this script yet.")
 
 def build_inference_cube(tile_id, target_date, catalog, static_catalog, context, gap, maxima):
-    """Laadt data en bouwt een genormaliseerde input cube [C, T, H, W]."""
+    """Loads data and builds a normalized input cube [C, T, H, W]."""
     print(f"Building input cube for {tile_id} @ {target_date}...")
     
     # 1. Temporal Window
@@ -59,7 +59,7 @@ def build_inference_cube(tile_id, target_date, catalog, static_catalog, context,
     # 2. Stack Dynamic
     X, variables, dates = stack_rasters(subset) # [V, T, H, W]
     
-    # Haal geospatial profiel op van de eerste raster (voor export later)
+    # Retrieve geospatial profile from the first raster (for later export)
     ref_path = subset.iloc[0]["path"]
     with rasterio.open(ref_path) as src:
         profile = src.profile.copy()
@@ -74,7 +74,7 @@ def build_inference_cube(tile_id, target_date, catalog, static_catalog, context,
         found_static_vars = []
         
         for v in sorted(static_records["variable"].unique()):
-            # Pak recentste snapshot
+            # Take most recent snapshot
             path = static_records[static_records["variable"] == v].sort_values("date").iloc[-1]["path"]
             with rasterio.open(path) as src:
                 arr = src.read(1).astype(np.float32)
@@ -84,7 +84,7 @@ def build_inference_cube(tile_id, target_date, catalog, static_catalog, context,
         if static_arrays:
             static_cube = np.stack(static_arrays, axis=0) # [V_stat, H, W]
             
-            # Normalize static (trick: maak tijdelijk 4D)
+            # Normalize static (trick: make temporarily 4D)
             static_cube_4d = static_cube[:, None, :, :]
             static_cube_4d = normalize_cube_auto(
                 static_cube_4d, found_static_vars, maxima=maxima, overflow="clip", nan_policy="zero"
@@ -102,7 +102,7 @@ def build_inference_cube(tile_id, target_date, catalog, static_catalog, context,
 
 def predict_sliding_window(model, X, patch_size=256, overlap=32, device='cuda'):
     """
-    Voert inference uit m.b.v. sliding window om geheugenproblemen te voorkomen.
+    Runs inference using a sliding window to prevent memory issues.
     X shape: [C, T, H, W]
     """
     C, T, H, W = X.shape
@@ -114,8 +114,8 @@ def predict_sliding_window(model, X, patch_size=256, overlap=32, device='cuda'):
     
     print(f"Running inference on shape {X.shape} with patches...")
 
-    # Pad image if needed (simpel: we slaan randgevallen even over of croppen, 
-    # voor productie zou je padding toevoegen)
+    # Pad image if needed (simple: we skip edge cases or crop for now, 
+    # for production you would add padding)
     
     for r in tqdm(range(0, H - patch_size + 1, stride)):
         for c in range(0, W - patch_size + 1, stride):
