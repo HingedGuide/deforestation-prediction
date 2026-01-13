@@ -135,17 +135,17 @@ MAX_CONTEXT = 12
 GAP = 1
 
 SPLIT_CFG = TemporalSplitConfig(
-    train_end="2022-12-01",  # 12 months of training
-    val_end="2023-12-01",    # 12 months of validation (contiguous)
-    test_start="2024-07-01", # 6 months gap (Jan-Jun 2024 skipped)
-    test_end="2025-06-01",   # 12 months of testing
+    train_end="2023-12-01",   # Train targets: Jan 2022 t/m Dec 2023
+    val_end="2024-12-01",     # Val raw eindigt Dec 2024
+    test_start="2025-01-01",  # Test targets: Jan 2025
+    test_end="2025-05-01",    # Test targets: t/m Mei 2025
     context=MAX_CONTEXT,
     gap=GAP,
 )
 
 # Validation start date (real, after filtering)
 # First few months of validation are filtered out to prevent leakage from training period
-VAL_START_DATE_REAL = "2023-01-01"
+VAL_START_DATE_REAL = "2024-06-01"
 
 PATCH_SIZE = 64
 
