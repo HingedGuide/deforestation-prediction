@@ -14,5 +14,5 @@ mamba activate /opt/mamba/envs/python312
 cd ~/DL_Deforestation_Prediction
 export PYTHONPATH=$PYTHONPATH:$(pwd)/src
 
-# 3. Run preprocessing for 6 months context
+# 3. Run preprocessing for 3 months context
 python src/deforestation_predictor/preprocessing/build_3d_dataset.py
