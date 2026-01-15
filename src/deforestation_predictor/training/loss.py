@@ -63,3 +63,34 @@ class DiceLoss(nn.Module):
 
         # 5. Return Loss (1 - Dice)
         return 1 - dice
+    
+
+class WeightedFocalLoss(nn.Module):
+    """
+    Weighted Focal Loss implementation matching Laura's setup.
+    """
+    def __init__(self, alpha=.25, gamma=2):
+        super(WeightedFocalLoss, self).__init__()
+        self.alpha = torch.tensor([alpha, 1-alpha]) # [weight_class_0, weight_class_1]
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        # Laura's code often expects targets not to be one-hot encoded for CrossEntropy logic,
+        # but inputs as logits (before softmax/sigmoid).
+        
+        # Ensure inputs are logits (B, C, H, W)
+        # Ensure targets are (B, H, W) with values 0 or 1
+        
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        
+        targets = targets.type(torch.long)
+        
+        # Check if we need to move alpha to the correct device
+        if self.alpha.device != inputs.device:
+            self.alpha = self.alpha.to(inputs.device)
+            
+        at = self.alpha.gather(0, targets.data.view(-1))
+        pt = torch.exp(-BCE_loss)
+        F_loss = at * (1-pt)**self.gamma * BCE_loss
+        
+        return F_loss.mean()
