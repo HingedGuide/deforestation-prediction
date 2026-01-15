@@ -9,7 +9,7 @@ from sklearn.metrics import precision_recall_curve, auc, precision_score, recall
 
 from deforestation_predictor.training.dataset import DeforestationDataset
 from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
-from deforestation_predictor.training.loss import FocalLoss
+from deforestation_predictor.training.loss import FocalLoss, DiceLoss
 from deforestation_predictor.utils.logger import setup_logger
 
 # Initialize logger for this module
@@ -64,7 +64,7 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
     wandb.log({"Visual Results": images_to_log}, step=epoch)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+def train_one_epoch(model, loader, optimizer, criterion_focal, criterion_dice, device, epoch):
     model.train()
     total_loss = 0.0
     all_preds = []
@@ -77,7 +77,11 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
 
         optimizer.zero_grad()
         logits = model(X)
-        loss = criterion(logits, y)
+        # Combined Loss: Focal + Dice
+        loss_focal = criterion_focal(logits, y)
+        loss_dice = criterion_dice(logits, y)
+        loss = loss_focal + loss_dice
+
         loss.backward()
         optimizer.step()
 
@@ -108,7 +112,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, return_preds=False):
+def validate(model, loader, criterion_focal, criterion_dice, device, return_preds=False):
     """
     Runs validation. If return_preds=True, returns the full probability and target arrays
     for threshold optimization.
@@ -121,7 +125,11 @@ def validate(model, loader, criterion, device, return_preds=False):
     for X, y in tqdm(loader, desc="Validation", leave=False):
         X, y = X.to(device), y.to(device)
         logits = model(X)
-        loss = criterion(logits, y)
+        # Combined Loss: Focal + Dice
+        loss_focal = criterion_focal(logits, y)
+        loss_dice = criterion_dice(logits, y)
+        loss = loss_focal + loss_dice
+        
         total_loss += loss.item()
 
         probs = torch.softmax(logits, dim=1)[:, 1, :, :]
@@ -205,7 +213,10 @@ def main():
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        criterion = FocalLoss(alpha=0.25, gamma=2.0).to(device)
+        
+        # Focal and Dice Losses
+        criterion_focal = FocalLoss(alpha=0.25, gamma=2.0).to(device)
+        criterion_dice = DiceLoss(smooth=1.0).to(device)
 
         best_auc = 0.0
         filename = f"{args.wandb_run_name or args.model_type}_best.pth"
@@ -214,8 +225,14 @@ def main():
         # --- Training Loop ---
         for epoch in range(args.epochs):
             logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
-            train_loss, train_auc = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
-            val_loss, val_auc = validate(model, val_loader, criterion, device)
+            
+            # Both Focal and Dice losses passed to train and validate
+            train_loss, train_auc = train_one_epoch(
+                model, train_loader, optimizer, criterion_focal, criterion_dice, device, epoch
+            )
+            val_loss, val_auc = validate(
+                model, val_loader, criterion_focal, criterion_dice, device
+            )
 
             wandb.log({
                 "epoch": epoch + 1,
@@ -250,7 +267,9 @@ def main():
 
         # 3. Find Optimal Threshold on Validation Set
         # We re-run validation on the best model to get predictions
-        _, _, val_probs, val_targets = validate(model, val_loader, criterion, device, return_preds=True)
+        _, _, val_probs, val_targets = validate(
+            model, val_loader, criterion_focal, criterion_dice, device, return_preds=True
+        )
         
         prec, rec, thresholds = precision_recall_curve(val_targets, val_probs)
         beta = 0.5
@@ -262,7 +281,9 @@ def main():
         logger.info(f"Optimal Threshold found on Val: {best_threshold:.4f} (Val F0.5: {val_f05:.4f})")
 
         # 4. Evaluate on Test Set
-        test_loss, test_auc, test_probs, test_targets = validate(model, test_loader, criterion, device, return_preds=True)
+        test_loss, test_auc, test_probs, test_targets = validate(
+            model, test_loader, criterion_focal, criterion_dice, device, return_preds=True
+        )
         
         # Apply threshold
         test_preds = (test_probs >= best_threshold).astype(int)
