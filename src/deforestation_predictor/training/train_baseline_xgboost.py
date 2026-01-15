@@ -19,8 +19,9 @@ IGNORE_LABEL = 2
 
 # Cluster Settings
 N_ESTIMATORS = 200
-MAX_DEPTH = 6
+MAX_DEPTH = 8  # Increased from 6 to 8 to capture subtler 3m patterns
 VAL_TEST_SAMPLE_RATE = 0.2
+TRAIN_SAMPLE_RATE = 0.05 # Decreased from 0.1 to 0.05 to reduce class imbalance
 
 
 # ------------- LOGGING SETUP ------------- #
@@ -162,7 +163,7 @@ if __name__ == "__main__":
     wandb.init(
         project="deforestation-prediction", 
         name=run_name, 
-        tags=["baseline", "xgboost"],
+        tags=["baseline", "xgboost", "optimized"],
         config=vars(args)
     )
 
@@ -172,7 +173,7 @@ if __name__ == "__main__":
         args.data_root, 
         "train", 
         context_length=args.context_months, 
-        sample_rate=0.1, 
+        sample_rate=TRAIN_SAMPLE_RATE,  # Use lower sample rate to reduce imbalance
         balanced=True
     )
 
@@ -190,10 +191,20 @@ if __name__ == "__main__":
         logger.info(f"Step 2: Training XGBoost on GPU ({X_train.shape[0]} samples)...")
         logger.info(f"Feature count per pixel: {X_train.shape[1]}")
 
+        # --- CLASS IMBALANCE CORRECTION ---
+        # Calculate scale_pos_weight dynamically based on the loaded training data
+        n_pos = np.sum(y_train == 1)
+        n_neg = np.sum(y_train == 0)
+        scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+        
+        logger.info(f"Class Balance - Pos: {n_pos}, Neg: {n_neg}")
+        logger.info(f"Calculated scale_pos_weight: {scale_pos_weight:.2f}")
+
         model = xgb.XGBClassifier(
             n_estimators=N_ESTIMATORS,
             max_depth=MAX_DEPTH,
             learning_rate=0.1,
+            scale_pos_weight=scale_pos_weight, # Apply weight to prioritize minority class (deforestation)
             n_jobs=-1,
             tree_method='hist',
             device='cpu',
