@@ -136,8 +136,8 @@ GAP = 1
 
 SPLIT_CFG = TemporalSplitConfig(
     train_end="2023-12-01",   # Train targets: Jan 2022 t/m Dec 2023
-    val_end="2024-12-01",     # Val raw eindigt Dec 2024
-    test_start="2025-01-01",  # Test targets: Jan 2025
+    val_end="2024-11-01",     # Val raw eindigt Dec 2024
+    test_start="2024-12-01",  # Test targets: Jan 2025
     test_end="2025-05-01",    # Test targets: t/m Mei 2025
     context=MAX_CONTEXT,
     gap=GAP,
