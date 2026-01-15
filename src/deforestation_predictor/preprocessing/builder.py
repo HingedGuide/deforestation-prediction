@@ -349,25 +349,30 @@ def balanced_random_spatial_crops(
 
     def sample_positive_patch() -> tuple[int, int]:
         """
-        Sample a patch that contains at least one positive pixel,
-        by choosing a positive pixel and placing a patch around it.
+        Sample a patch centered around a deforestation pixel.
         """
         if pos_coords.size == 0:
-            # No positives at all in this tile → fall back to negative sampling
             return sample_negative_patch()
 
+        # Select a random deforestation pixel
         r_pos, c_pos = pos_coords[rng.integers(0, len(pos_coords))]
 
-        # Choose a top-left (r0, c0) so that:
-        # - patch stays within [0, H-ps] x [0, W-ps]
-        # - (r_pos, c_pos) lies inside the patch
-        r_min = max(0, r_pos - ps + 1)
-        r_max = min(r_pos, H - ps)
-        c_min = max(0, c_pos - ps + 1)
-        c_max = min(c_pos, W - ps)
+        # Attempt to place the pixel in the center of the patch
+        # r0 is the top-left starting coordinate
+        
+        # Ideal start position (so r_pos is in the center)
+        ideal_r0 = r_pos - ps // 2
+        ideal_c0 = c_pos - ps // 2
+        
+        # Add a small amount of 'jitter' (noise) so it's not ALWAYS exactly the center
+        # (e.g., +/- 10% of the patch size). This helps prevent overfitting.
+        jitter = int(ps * 0.1) 
+        r0 = ideal_r0 + rng.integers(-jitter, jitter + 1)
+        c0 = ideal_c0 + rng.integers(-jitter, jitter + 1)
 
-        r0 = rng.integers(r_min, r_max + 1)
-        c0 = rng.integers(c_min, c_max + 1)
+        # Clip within the image boundaries [0, H-ps]
+        r0 = max(0, min(r0, max_row))
+        c0 = max(0, min(c0, max_col))
 
         return int(r0), int(c0)
 
