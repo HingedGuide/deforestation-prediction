@@ -66,31 +66,37 @@ class DiceLoss(nn.Module):
     
 
 class WeightedFocalLoss(nn.Module):
-    """
-    Weighted Focal Loss implementation matching Laura's setup.
-    """
-    def __init__(self, alpha=.25, gamma=2):
-        super(WeightedFocalLoss, self).__init__()
-        self.alpha = torch.tensor([alpha, 1-alpha]) # [weight_class_0, weight_class_1]
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=2):
+        super().__init__()
+        self.alpha = alpha
         self.gamma = gamma
+        self.ignore_index = ignore_index
 
-    def forward(self, inputs, targets):
-        # Laura's code often expects targets not to be one-hot encoded for CrossEntropy logic,
-        # but inputs as logits (before softmax/sigmoid).
+    def forward(self, inputs, targets, weight_mask):
+        # inputs: [B, C, H, W] (logits)
+        # targets: [B, H, W] (labels)
+        # weight_mask: [B, H, W] (weights)
+
+        # Filter ignore_index
+        valid_mask = targets != self.ignore_index
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=inputs.device, requires_grad=True)
+
+        # Apply the filter to targets and weight_mask
+        targets = targets[valid_mask]
+        weight_mask = weight_mask[valid_mask]  # Filter weights to match valid pixels
+
+        inputs = inputs.permute(0, 2, 3, 1)  # [B, H, W, C]
+        inputs = inputs[valid_mask]  # [N, C]
+
+        # Standard Cross Entropy
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
         
-        # Ensure inputs are logits (B, C, H, W)
-        # Ensure targets are (B, H, W) with values 0 or 1
+        # Apply the weight mask (Logic from src/models.py)
+        ce_loss = ce_loss * weight_mask 
         
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        
-        targets = targets.type(torch.long)
-        
-        # Check if we need to move alpha to the correct device
-        if self.alpha.device != inputs.device:
-            self.alpha = self.alpha.to(inputs.device)
-            
-        at = self.alpha.gather(0, targets.data.view(-1))
-        pt = torch.exp(-BCE_loss)
-        F_loss = at * (1-pt)**self.gamma * BCE_loss
-        
-        return F_loss.mean()
+        pt = torch.exp(-ce_loss)
+
+        # Focal term
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        return focal_loss.mean()
