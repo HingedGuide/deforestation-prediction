@@ -1,6 +1,6 @@
 # Spatio-Temporal Deforestation Prediction
 
-This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (3D CNN, ResUNet, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters into machine-learning-ready 3D cubes.
+This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (XGBoost, ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters into machine-learning-ready 3D cubes.
 
 ## Directory Structure
 
@@ -18,6 +18,10 @@ src/deforestation_predictor/
 │   ├── loss.py                # Focal Loss implementation
 │   ├── train_experiment.py    # Main DL training loop
 │   └── train_baseline_xgboost.py # Tabular ML baseline
+├── visualization/
+│   ├── predict_tile.py        # DL Inference on a full tile
+│   ├── predict_tile_xgboost.py # XGBoost inference on a full tile
+│   └── visualize_predictions.py # Visualization of samples
 └── utils/                     # Logging and filename parsing helpers
 ```
 
@@ -78,8 +82,12 @@ Note: Ensure that the `DATA_ROOT` variable inside the script points to your proc
 ## Metrics and loss
 
 - **Loss function:** Focal loss is used to handle the extreme class imbalance between forest and deforestation pixels.
-- **Evaluation:** The primary metric is PR-AUC (Area under the Precision-Recall Curve).
+- **Evaluation:** The primary metric is F0.5
 - **Visuals:** The training script automatically logs validation predictions (Input vs Groundtruth vs Prediction) to Weights & Biases.
+
+## Visualization
+
+Use `predict_tile.py` for predicting a full tile with a trained DL model. `predict_tile_xgboost.py` has the same function, but only works for XGBoost. 
 
 ## Testing
 
