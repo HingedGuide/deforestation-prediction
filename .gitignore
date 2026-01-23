@@ -9,3 +9,4 @@ __pycache__/
 /checkpoints/
 /checkpoints_6m_horizon/
 /data_6m/
+/slurm_requests/
