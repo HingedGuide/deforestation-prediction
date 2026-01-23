@@ -18,6 +18,55 @@ from deforestation_predictor.preprocessing.windows import (
 )
 
 
+def parse_tile_bounds(tile_id: str) -> tuple[float, float, float, float]:
+    """
+    Retrieves bounds (south, west, north, east) from a tile ID like '10N_010E'.
+    """
+    # Parse latitude (e.g., 10N) and longitude (e.g., 010E)
+    parts = tile_id.split("_")
+    lat_str, lon_str = parts[0], parts[1]
+
+    lat = int(lat_str[:-1])
+    lon = int(lon_str[:-1])
+
+    # Define bounds (10x10 degree tiles)
+    if 'S' in lat_str:
+        north = -lat
+        south = -lat - 10
+    else:
+        south = lat - 10
+        north = lat
+
+    if 'W' in lon_str:
+        east = -lon + 10
+        west = -lon
+    else:
+        west = lon
+        east = lon + 10
+
+    return south, west, north, east
+
+
+def generate_coordinate_grids(tile_id: str, height: int, width: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Generates normalized X and Y grids in range [-1, 1].
+    """
+    south, west, north, east = parse_tile_bounds(tile_id)
+    
+    # Create linspaces
+    # Note: Y goes from North to South (top to bottom in image)
+    lats = np.linspace(north, south, height)
+    lons = np.linspace(west, east, width)
+    
+    # Y grid (Latitude) - varies over height (rows)
+    Y_grid = np.tile(lats[:, None], (1, width)) / 90.0
+
+    # X grid (Longitude) - varies over width (cols)
+    X_grid = np.tile(lons[None, :], (height, 1)) / 180.0
+    
+    return X_grid.astype(np.float32), Y_grid.astype(np.float32)
+
+
 def stack_rasters(records: pd.DataFrame) -> Tuple[np.ndarray, List[str], List[pd.Timestamp]]:
     """
     Stack rasters from a catalog subset into an array [V, T, H, W].
@@ -233,6 +282,20 @@ def build_sample(
                 # concatenate along channel dimension
                 X = np.concatenate([X, static_broadcast], axis=0)
                 variables = list(variables) + static_vars
+
+    # Add X and Y coordinate channels
+    grid_x, grid_y = generate_coordinate_grids(tile_id, X.shape[2], X.shape[3]) # H, W
+    
+    # Stack to shape [2, H, W]
+    coords_cube = np.stack([grid_x, grid_y], axis=0)
+    
+    # Broadcast over time: [2, T, H, W]
+    T_len = X.shape[1]
+    coords_broadcast = np.repeat(coords_cube[:, None, :, :], T_len, axis=1)
+    
+    # Add to the head of X
+    X = np.concatenate([X, coords_broadcast], axis=0)
+    variables = list(variables) + ["coord_x", "coord_y"]
 
     # 5) load GT
     T = pd.to_datetime(target_date)
