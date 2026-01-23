@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 class ResidualBlock(nn.Module):
     """
@@ -53,6 +54,47 @@ class ResidualBlock(nn.Module):
         out += residual
         out = self.relu(out)
         return out
+
+
+class ResidualConv(nn.Module):
+    """
+    Residual Convolution Block as used in Laura's implementation (Pre-activation).
+    Structure: BN -> ReLU -> Conv -> BN -> ReLU -> Conv (+ Skip Conv)
+    """
+    def __init__(self, input_dim, kernel_size, output_dim, stride, padding):
+        super(ResidualConv, self).__init__()
+
+        self.conv_block = nn.Sequential(
+            nn.BatchNorm2d(input_dim),
+            nn.ReLU(),
+            nn.Conv2d(
+                input_dim, output_dim, kernel_size=kernel_size, stride=stride, padding=padding
+            ),
+            nn.BatchNorm2d(output_dim),
+            nn.ReLU(),
+            nn.Conv2d(output_dim, output_dim, kernel_size=3, padding=1),
+        )
+        self.conv_skip = nn.Sequential(
+            nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, stride=stride, padding=padding),
+            nn.BatchNorm2d(output_dim),
+        )
+
+    def forward(self, x):
+        return self.conv_block(x) + self.conv_skip(x)
+
+
+class Upsample(nn.Module):
+    """
+    Upsampling layer using ConvTranspose2d.
+    """
+    def __init__(self, input_dim, output_dim, kernel, stride):
+        super(Upsample, self).__init__()
+        self.upsample = nn.ConvTranspose2d(
+            input_dim, output_dim, kernel_size=kernel, stride=stride
+        )
+
+    def forward(self, x):
+        return self.upsample(x)
 
 
 class ResidualBlock3D(nn.Module):
@@ -121,101 +163,101 @@ class ResidualBlock3D(nn.Module):
 
 class ResUNet(nn.Module):
     """
-    2D ResUNet for 3D Input (Early Fusion / "Flat" Time).
-
-    This model flattens the temporal dimension into the channel dimension.
-    For example, if input is 10 time steps with 3 bands, it processes it as a single
-    2D image with 30 channels.
-
-    Strategy:
-        1. Flatten Time -> Channels.
-        2. Encoder (Residual Blocks with downsampling).
-        3. Bridge.
-        4. Decoder (Upsampling + Skip Connections).
-
+    Adapted 2D ResUNet based on Laura's 'resunet_s1.py'.
+    
+    Fixes applied for integration:
+    1. Removed dead/buggy 'adjusting_layer'.
+    2. Added 1x1 projections in decoder to handle skip connections when using increasing filter sizes (e.g., 64->128->256).
+    3. Flattens temporal dimension for Early Fusion.
+    
     Args:
         in_channels (int): Number of channels per time step.
         time_depth (int): Number of time steps in the input sequence.
         num_classes (int, optional): Number of output classes. Defaults to 2.
-        filters (list, optional): List of channel counts for each encoder level. Defaults to [32, 64, 128, 256].
+        filters (list, optional): Channel counts. Defaults to [64, 128, 256, 512].
     """
 
-    def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
-        super().__init__()
+    def __init__(self, in_channels, time_depth, num_classes=2, filters=[64, 128, 256, 512]):
+        super(ResUNet, self).__init__()
 
         # Total input channels = variables * time_steps (Early Fusion)
         input_dim = in_channels * time_depth
+        
+        if len(filters) < 4:
+            filters = [64, 128, 256, 512]
 
-        # Encoder
+        # --- Encoder ---
         self.input_layer = nn.Sequential(
-            nn.Conv2d(input_dim, filters[0], kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(input_dim, filters[0], kernel_size=7, stride=2, padding=0),
             nn.BatchNorm2d(filters[0]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(filters[0]),
-            nn.ReLU(inplace=True)
+            nn.ReLU(),
+            nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
+        )
+        self.input_skip = nn.Sequential(
+            nn.Conv2d(input_dim, filters[0], kernel_size=7, stride=2, padding=0)
+        )
+        
+        # Encoder Blocks
+        self.residual_conv_1 = ResidualConv(filters[0], 7, filters[1], 2, 1)
+        self.residual_conv_2 = ResidualConv(filters[1], 7, filters[2], 2, 0)
+
+        # --- Bridge ---
+        # Bridge input is output of residual_conv_2 (filters[2])
+        self.bridge = ResidualConv(filters[2], 3, filters[3], 2, 0)
+
+        # --- Decoder ---
+        # Projections: Necessary if filters[i] != filters[i+1] to allow summation
+        self.skip_proj_3 = nn.Conv2d(filters[2], filters[3], kernel_size=1) if filters[2] != filters[3] else nn.Identity()
+        self.up_residual_conv1 = ResidualConv(filters[3], 3, filters[2], 1, 0)
+
+        self.skip_proj_2 = nn.Conv2d(filters[1], filters[2], kernel_size=1) if filters[1] != filters[2] else nn.Identity()
+        self.up_residual_conv2 = ResidualConv(filters[2], 3, filters[1], 1, 0)
+
+        self.skip_proj_1 = nn.Conv2d(filters[0], filters[1], kernel_size=1) if filters[0] != filters[1] else nn.Identity()
+        self.up_residual_conv3 = ResidualConv(filters[1], 3, filters[0], 1, 0)
+
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(filters[0], num_classes, 1, 1),
         )
 
-        self.res_down1 = ResidualBlock(filters[0], filters[1], stride=2)
-        self.res_down2 = ResidualBlock(filters[1], filters[2], stride=2)
-        self.res_down3 = ResidualBlock(filters[2], filters[3], stride=2)
-
-        # Bridge
-        self.bridge = ResidualBlock(filters[3], filters[3], stride=1)
-
-        # Decoder
-        self.up3 = nn.ConvTranspose2d(filters[3], filters[2], kernel_size=2, stride=2)
-        self.res_up3 = ResidualBlock(filters[2] + filters[2], filters[2])  # + filters[2] for concat
-
-        self.up2 = nn.ConvTranspose2d(filters[2], filters[1], kernel_size=2, stride=2)
-        self.res_up2 = ResidualBlock(filters[1] + filters[1], filters[1])
-
-        self.up1 = nn.ConvTranspose2d(filters[1], filters[0], kernel_size=2, stride=2)
-        self.res_up1 = ResidualBlock(filters[0] + filters[0], filters[0])
-
-        self.classifier = nn.Conv2d(filters[0], num_classes, kernel_size=1)
-
     def forward(self, x):
-        """
-        Forward pass.
-
-        Args:
-            x (torch.Tensor): Input shape [Batch, Channels, Time, Height, Width].
-
-        Returns:
-            torch.Tensor: Logits of shape [Batch, num_classes, Height, Width].
-        """
-        # x shape: [Batch, Channels, Time, Height, Width]
+        # 1. Flatten Time into Channels: [B, C, T, H, W] -> [B, C*T, H, W]
         b, c, t, h, w = x.shape
-
-        # Flatten Time into Channels: [Batch, C*T, H, W]
         x = x.view(b, c * t, h, w)
 
-        # Encoder
-        x1 = self.input_layer(x)  # [B, 32, H, W]
-        x2 = self.res_down1(x1)   # [B, 64, H/2, W/2]
-        x3 = self.res_down2(x2)   # [B, 128, H/4, W/4]
-        x4 = self.res_down3(x3)   # [B, 256, H/8, W/8]
+        # --- Encode ---
+        x1 = self.input_layer(x) + self.input_skip(x)
+        x2 = self.residual_conv_1(x1)
+        x3 = self.residual_conv_2(x2)
 
-        # Bridge
-        bridge = self.bridge(x4)
+        # --- Bridge ---
+        x4 = self.bridge(x3) 
+        
+        # --- Decode ---
+        # Block 1
+        x4 = F.interpolate(x4, size=x3.size()[2:], mode='bilinear', align_corners=True)
+        # Summation requires matching channels, so we project x3 if needed
+        x5 = x4 + self.skip_proj_3(x3)
+        x6 = self.up_residual_conv1(x5)
 
-        # Decoder (with skip connections)
-        up3 = self.up3(bridge)    # [B, 128, H/4, W/4]
-        concat3 = torch.cat([up3, x3], dim=1)
-        dec3 = self.res_up3(concat3)
+        # Block 2
+        x6 = F.interpolate(x6, size=x2.size()[2:], mode='bilinear', align_corners=True)
+        x7 = x6 + self.skip_proj_2(x2)
+        x8 = self.up_residual_conv2(x7)
 
-        up2 = self.up2(dec3)      # [B, 64, H/2, W/2]
-        concat2 = torch.cat([up2, x2], dim=1)
-        dec2 = self.res_up2(concat2)
+        # Block 3
+        x8 = F.interpolate(x8, size=x1.size()[2:], mode='bilinear', align_corners=True)
+        x9 = x8 + self.skip_proj_1(x1)
+        x10 = self.up_residual_conv3(x9)
+        
+        output = self.output_layer(x10)
+        
+        # --- Safety Interpolation ---
+        # Ensure output size matches original input size (h, w)
+        if output.shape[-2:] != (h, w):
+            output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
 
-        up1 = self.up1(dec2)      # [B, 32, H, W]
-        concat1 = torch.cat([up1, x1], dim=1)
-        dec1 = self.res_up1(concat1)
-
-        logits = self.classifier(dec1)  # [B, num_classes, H, W]
-        return logits
-
+        return output
 
 class ResUNet3D(nn.Module):
     """
