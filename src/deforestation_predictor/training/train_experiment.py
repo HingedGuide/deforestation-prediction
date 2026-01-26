@@ -1,4 +1,5 @@
 import argparse
+import math
 import torch
 import numpy as np
 import wandb
@@ -9,7 +10,7 @@ from sklearn.metrics import precision_recall_curve, auc, precision_score, recall
 
 from deforestation_predictor.training.dataset import DeforestationDataset
 from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
-from deforestation_predictor.training.loss import WeightedFocalLoss
+from deforestation_predictor.training.loss import WeightedFocalLoss, CombinedLoss
 from deforestation_predictor.utils.logger import setup_logger
 
 # Initialize logger for this module
@@ -64,15 +65,34 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
     wandb.log({"Visual Results": images_to_log}, step=epoch)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
     model.train()
     total_loss = 0.0
+
+    total_steps = len(loader) * args.epochs
+    warmup_steps = len(loader) * args.warmup_epochs
+
+    warmup_schedule = np.linspace(0, args.lr, warmup_steps)
+    iters = np.arange(total_steps - warmup_steps)
+    cosine_schedule = np.array([
+        0 + 0.5 * (args.lr - 0) * (1 + math.cos(math.pi * t / (total_steps - warmup_steps)))
+        for t in iters
+    ])
+
+    lr_schedule = np.concatenate((warmup_schedule, cosine_schedule))
+
     all_preds = []
     all_targets = []
 
     pbar = tqdm(loader, desc="Training", leave=False)
 
     for step, (X, y) in enumerate(pbar):
+        global_step = epoch * len(loader) + step
+        if global_step < len(lr_schedule):
+            current_lr = lr_schedule[global_step]
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+
         X, y = X.to(device), y.to(device)
 
         # Create weight mask (ones for now, or use balance logic)
@@ -182,6 +202,7 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument('--mode', type=str, default='sequence', choices=['sequence', 'snapshot'],
                     help="Training mode: 'sequence' for 3D models (time history), 'snapshot' for 2D models (single random frame).")
+    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of warmup epochs")
 
     args = parser.parse_args()
 
@@ -232,7 +253,10 @@ def main():
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-        criterion = WeightedFocalLoss(alpha=0.25, gamma=2.0).to(device)
+
+        # Select Loss Function
+        # criterion = WeightedFocalLoss(alpha=0.25, gamma=2.0).to(device)
+        criterion = CombinedLoss(dice_weight=0.5, focal_weight=0.5).to(device)
 
         best_f05 = 0.0  # Changed from best_auc
         filename = f"{args.wandb_run_name or args.model_type}_best.pth"
@@ -243,7 +267,7 @@ def main():
             logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
             
             # Unpack new return values
-            train_loss, train_auc, train_f05 = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
+            train_loss, train_auc, train_f05 = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, args)
             val_loss, val_auc, val_f05 = validate(model, val_loader, criterion, device)
 
             wandb.log({

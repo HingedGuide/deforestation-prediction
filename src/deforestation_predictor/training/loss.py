@@ -84,6 +84,8 @@ class WeightedFocalLoss(nn.Module):
 
         # Apply the filter to targets and weight_mask
         targets = targets[valid_mask]
+        
+        # TODO maybe change weight_mask[y==1] = 10.0 so that deforestation pixels are weighted more??
         weight_mask = weight_mask[valid_mask]  # Filter weights to match valid pixels
 
         inputs = inputs.permute(0, 2, 3, 1)  # [B, H, W, C]
@@ -100,3 +102,45 @@ class WeightedFocalLoss(nn.Module):
         # Focal term
         focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
         return focal_loss.mean()
+    
+class WeightedBCELoss(nn.Module):
+    def __init__(self):
+        super(WeightedBCELoss, self).__init__()
+
+    def forward(self, inputs, targets, weight_mask):
+        # inputs: logits, targets: 0/1, weight_mask: weights
+        bce = F.binary_cross_entropy_with_logits(inputs, targets.float(), reduction='none')
+        # Apply mask
+        weighted_bce = bce * weight_mask
+        return weighted_bce.mean()
+
+class WeightedDiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super(WeightedDiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, y_pred, y_true, weight_mask):
+        # inputs: logits -> sigmoid
+        y_pred = torch.sigmoid(y_pred)
+        
+        # Flatten
+        y_pred = y_pred.view(-1)
+        y_true = y_true.view(-1)
+        weight_mask = weight_mask.view(-1)
+        
+        # Weighted Intersection & Union
+        intersection = (y_pred * y_true * weight_mask).sum()
+        union = (y_pred * weight_mask).sum() + (y_true * weight_mask).sum()
+        
+        dice = (2. * intersection + self.smooth) / (union + self.smooth)
+        
+        return 1 - dice
+
+class CombinedLoss(nn.Module):
+    def __init__(self):
+        super(CombinedLoss, self).__init__()
+        self.bce = WeightedBCELoss()
+        self.dice = WeightedDiceLoss()
+
+    def forward(self, inputs, targets, weight_mask):
+        return self.bce(inputs, targets, weight_mask) + self.dice(inputs, targets, weight_mask)
