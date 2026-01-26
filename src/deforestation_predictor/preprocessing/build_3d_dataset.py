@@ -72,7 +72,7 @@ REGION_INPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "input"
 REGION_GT_ROOT = PROJECT_ROOT / "data" / "processed" / "groundtruth"
 
 # Where 3D dataset .npz will be written
-OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed_3d" / REGION_ID
+OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / REGION_ID
 
 # Which variables you want the 3D CNN to see (snapshot / monthly)
 # firealerts, nightlights and fw are not available for full time range
@@ -84,11 +84,19 @@ MONTHLY_VARS = [
     'confidence',
     #'fwi',
     'lastmonth',
+    'lastthreemonths', # For XGBoost and ResUnet test
+    'lastsixmonths', # For XGBoost and ResUnet test
     'timesinceloss',
     'totallossalerts',
     'previoussameseason',
-    'patchdensity'
+    'patchdensity',
+    'smoothedsixmonths',
+    'smoothedtotal',
+    
 ]
+
+#TODO : oplossing vinden om losslastyear als input te gebruiken
+# Missing: 'losslastyear'
 
 STATIC_VARS = [
     "elevation",
@@ -129,33 +137,35 @@ CATEGORICAL_VARS: set[str] = {
     'wdpa',
 }
 
-CONTEXT = CONTEXT_MONTHS
-ANCHOR_DATE = "2022-01-01"
-MAX_CONTEXT = 12
+CONTEXT = 1
+ANCHOR_DATE = "2021-01-01"
+MAX_CONTEXT = 1
 GAP = 1
 
+# TODO : Adjust split dates test_end = 2024-09-01, test_start = 2024-04-01, train_start = 2021-01-01, train_end = 2023-04-01, val_start = 2023-10-01, val_end = 2024-03-01 
+
 SPLIT_CFG = TemporalSplitConfig(
-    train_end="2023-12-01",   # Train targets: Jan 2022 t/m Dec 2023
-    val_end="2024-11-01",     # Val raw eindigt Dec 2024
-    test_start="2024-12-01",  # Test targets: Jan 2025
-    test_end="2025-05-01",    # Test targets: t/m Mei 2025
+    train_end="2023-04-01",   # Train targets: Jan 2022 t/m Dec 2023
+    val_end="2024-03-01",     # Val raw eindigt Dec 2024
+    test_start="2024-04-01",  # Test targets: Jan 2025
+    test_end="2024-09-01",    # Test targets: t/m Mei 2025
     context=MAX_CONTEXT,
     gap=GAP,
 )
 
 # Validation start date (real, after filtering)
 # First few months of validation are filtered out to prevent leakage from training period
-VAL_START_DATE_REAL = "2024-06-01"
+VAL_START_DATE_REAL = "2023-10-01"
 
-PATCH_SIZE = 64
+PATCH_SIZE = 64 # 64x64 patches
 
 # Number of patches to extract per sample
 # I put this quite high to have more data for training
 # and also to have some overlapping patches so that the model can learn from it more robustly
 
-PATCHES_PER_SAMPLE_TRAIN = 800
-PATCHES_PER_SAMPLE_VAL = 800
-PATCHES_PER_SAMPLE_TEST = 800
+PATCHES_PER_SAMPLE_TRAIN = 1600 #Double from 800 to 1600 for more data
+PATCHES_PER_SAMPLE_VAL = 1600
+PATCHES_PER_SAMPLE_TEST = 1600
 
 # Fraction of patches that should contain deforestation (y=1)
 POS_FRACTION_TRAIN = 0.5
