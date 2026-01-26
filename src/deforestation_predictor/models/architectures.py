@@ -162,21 +162,6 @@ class ResidualBlock3D(nn.Module):
 
 
 class ResUNet(nn.Module):
-    """
-    Adapted 2D ResUNet based on Laura's 'resunet_s1.py'.
-    
-    Fixes applied for integration:
-    1. Removed dead/buggy 'adjusting_layer'.
-    2. Added 1x1 projections in decoder to handle skip connections when using increasing filter sizes (e.g., 64->128->256).
-    3. Flattens temporal dimension for Early Fusion.
-    
-    Args:
-        in_channels (int): Number of channels per time step.
-        time_depth (int): Number of time steps in the input sequence.
-        num_classes (int, optional): Number of output classes. Defaults to 2.
-        filters (list, optional): Channel counts. Defaults to [64, 128, 256, 512].
-    """
-
     def __init__(self, in_channels, time_depth, num_classes=2, filters=[64, 128, 256, 512]):
         super(ResUNet, self).__init__()
 
@@ -197,31 +182,28 @@ class ResUNet(nn.Module):
             nn.Conv2d(input_dim, filters[0], kernel_size=7, stride=2, padding=0)
         )
         
-        # Encoder Blocks
         self.residual_conv_1 = ResidualConv(filters[0], 7, filters[1], 2, 1)
         self.residual_conv_2 = ResidualConv(filters[1], 7, filters[2], 2, 0)
 
         # --- Bridge ---
-        # Bridge input is output of residual_conv_2 (filters[2])
         self.bridge = ResidualConv(filters[2], 3, filters[3], 2, 0)
 
-        # --- Decoder ---
-        # Projections: Necessary if filters[i] != filters[i+1] to allow summation
-        self.skip_proj_3 = nn.Conv2d(filters[2], filters[3], kernel_size=1) if filters[2] != filters[3] else nn.Identity()
-        self.up_residual_conv1 = ResidualConv(filters[3], 3, filters[2], 1, 0)
+        # --- Decoder (Aangepast voor Concatenation) ---
+        # Block 1: Input is cat(Bridge_out, Skip3). Bridge=filters[3], Skip3=filters[2]
+        self.up_residual_conv1 = ResidualConv(filters[3] + filters[2], 3, filters[2], 1, 0)
 
-        self.skip_proj_2 = nn.Conv2d(filters[1], filters[2], kernel_size=1) if filters[1] != filters[2] else nn.Identity()
-        self.up_residual_conv2 = ResidualConv(filters[2], 3, filters[1], 1, 0)
+        # Block 2: Input is cat(Up1_out, Skip2). Up1=filters[2], Skip2=filters[1]
+        self.up_residual_conv2 = ResidualConv(filters[2] + filters[1], 3, filters[1], 1, 0)
 
-        self.skip_proj_1 = nn.Conv2d(filters[0], filters[1], kernel_size=1) if filters[0] != filters[1] else nn.Identity()
-        self.up_residual_conv3 = ResidualConv(filters[1], 3, filters[0], 1, 0)
+        # Block 3: Input is cat(Up2_out, Skip1). Up2=filters[1], Skip1=filters[0]
+        self.up_residual_conv3 = ResidualConv(filters[1] + filters[0], 3, filters[0], 1, 0)
 
         self.output_layer = nn.Sequential(
             nn.Conv2d(filters[0], num_classes, 1, 1),
         )
 
     def forward(self, x):
-        # 1. Flatten Time into Channels: [B, C, T, H, W] -> [B, C*T, H, W]
+        # 1. Flatten Time into Channels
         b, c, t, h, w = x.shape
         x = x.view(b, c * t, h, w)
 
@@ -233,27 +215,25 @@ class ResUNet(nn.Module):
         # --- Bridge ---
         x4 = self.bridge(x3) 
         
-        # --- Decode ---
+        # --- Decode (Concatenation Style) ---
         # Block 1
         x4 = F.interpolate(x4, size=x3.size()[2:], mode='bilinear', align_corners=True)
-        # Summation requires matching channels, so we project x3 if needed
-        x5 = x4 + self.skip_proj_3(x3)
+        x5 = torch.cat([x4, x3], dim=1)  # <-- CONCAT
         x6 = self.up_residual_conv1(x5)
 
         # Block 2
         x6 = F.interpolate(x6, size=x2.size()[2:], mode='bilinear', align_corners=True)
-        x7 = x6 + self.skip_proj_2(x2)
+        x7 = torch.cat([x6, x2], dim=1)  # <-- CONCAT
         x8 = self.up_residual_conv2(x7)
 
         # Block 3
         x8 = F.interpolate(x8, size=x1.size()[2:], mode='bilinear', align_corners=True)
-        x9 = x8 + self.skip_proj_1(x1)
+        x9 = torch.cat([x8, x1], dim=1)  # <-- CONCAT
         x10 = self.up_residual_conv3(x9)
         
         output = self.output_layer(x10)
         
-        # --- Safety Interpolation ---
-        # Ensure output size matches original input size (h, w)
+        # Safety Interpolation
         if output.shape[-2:] != (h, w):
             output = F.interpolate(output, size=(h, w), mode='bilinear', align_corners=True)
 
