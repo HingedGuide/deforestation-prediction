@@ -17,13 +17,25 @@ from deforestation_predictor.preprocessing.windows import (
     GAP_MONTHS,
 )
 
-
 def parse_tile_bounds(tile_id: str) -> tuple[float, float, float, float]:
     """
-    Retrieves bounds (south, west, north, east) from a tile ID like '10N_010E'.
+    Retrieves bounds (south, west, north, east) from a tile ID.
+    Handles standard '10N_010E' format AND custom region IDs like 'GABON'.
     """
+    # --- Handle Custom Regions ---
+    if tile_id == "GABON":
+        # Bounds from build_3d_dataset.py: (8.4, -4.1, 14.6, 2.3) -> (west, south, east, north)
+        # Function expects: south, west, north, east
+        return -4.1, 8.4, 2.3, 14.6
+    # ----------------------------------
+
     # Parse latitude (e.g., 10N) and longitude (e.g., 010E)
     parts = tile_id.split("_")
+    
+    # Safety check if split fails
+    if len(parts) < 2:
+        raise ValueError(f"Invalid tile_id format: {tile_id}. Expected format 'Lat_Lon' or defined region.")
+
     lat_str, lon_str = parts[0], parts[1]
 
     lat = int(lat_str[:-1])

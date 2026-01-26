@@ -285,19 +285,27 @@ def main():
 
     if pd.isna(min_target_date):
         logger.warning("No training targets found, cannot compute maxima reliably.")
-        maxima = {}  # handle appropriately or return
+        maxima = {}
     else:
         min_input_date = min_target_date - DateOffset(months=CONTEXT + GAP - 1)
 
-        train_catalog_for_max = full_catalog[
-            (full_catalog["date"] >= min_input_date)
-            & (full_catalog["date"] <= max_input_date)
-            & (full_catalog["variable"].isin(MONTHLY_VARS + STATIC_VARS))
-            ].reset_index(drop=True)
+        # 1. Dynamic vars: Only within train time range
+        dynamic_mask = (
+            (full_catalog["date"] >= min_input_date) &
+            (full_catalog["date"] <= max_input_date) &
+            (full_catalog["variable"].isin(MONTHLY_VARS))
+        )
+        
+        # 2. Static vars: Always include
+        static_mask = full_catalog["variable"].isin(STATIC_VARS)
+
+        # Combine masks
+        train_catalog_for_max = full_catalog[dynamic_mask | static_mask].reset_index(drop=True)
+        # -----------------------------
 
         logger.info(
             f"    -> using {len(train_catalog_for_max)} rasters for maxima "
-            f"from {min_input_date.date()} to {max_input_date.date()}"
+            f"(Dynamic: {min_input_date.date()} to {max_input_date.date()} + All Static)"
         )
         maxima = compute_variable_maxima(train_catalog_for_max)
 
