@@ -256,7 +256,7 @@ def main():
 
         # Select Loss Function
         # criterion = WeightedFocalLoss(alpha=0.25, gamma=2.0).to(device)
-        criterion = CombinedLoss(dice_weight=0.5, focal_weight=0.5).to(device)
+        criterion = CombinedLoss().to(device)
 
         best_f05 = 0.0  # Changed from best_auc
         filename = f"{args.wandb_run_name or args.model_type}_best.pth"
