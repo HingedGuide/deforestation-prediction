@@ -20,7 +20,7 @@ IGNORE_LABEL = 2
 # Cluster Settings
 N_ESTIMATORS = 200
 MAX_DEPTH = 8  # Increased from 6 to 8 to capture subtler 3m patterns
-VAL_TEST_SAMPLE_RATE = 0.2
+VAL_TEST_SAMPLE_RATE = 0.2 # percentage of random pixels that are sampled in the val/test sets
 TRAIN_SAMPLE_RATE = 0.05 # Decreased from 0.1 to 0.05 to reduce class imbalance
 
 
