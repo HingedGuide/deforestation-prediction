@@ -180,6 +180,8 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="deforestation-prediction")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument('--mode', type=str, default='sequence', choices=['sequence', 'snapshot'],
+                    help="Training mode: 'sequence' for 3D models (time history), 'snapshot' for 2D models (single random frame).")
 
     args = parser.parse_args()
 
@@ -196,8 +198,8 @@ def main():
 
     try:
         # 1. Load Datasets
-        train_ds = DeforestationDataset(args.data_root, "train", context_length=args.context_months)
-        val_ds = DeforestationDataset(args.data_root, "val", context_length=args.context_months)
+        train_ds = DeforestationDataset(args.data_root, "train", context_length=args.context_months, mode=args.mode)
+        val_ds = DeforestationDataset(args.data_root, "val", context_length=args.context_months, mode=args.mode)
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
@@ -206,6 +208,11 @@ def main():
         sample_X, _ = train_ds[0]
         in_channels = sample_X.shape[0]
         time_depth = sample_X.shape[1]
+
+        if args.mode == 'snapshot':
+            time_depth = 1  # For snapshot mode, time depth is 1
+        else: # 'sequence' mode
+            time_depth = args.context_months if args.context_months else 12
 
         logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[2]}, W={sample_X.shape[3]}")
 
@@ -267,7 +274,7 @@ def main():
         
         # 2. Load Test Data
         try:
-            test_ds = DeforestationDataset(args.data_root, "test", context_length=args.context_months)
+            test_ds = DeforestationDataset(args.data_root, "test", context_length=args.context_months, mode=args.mode)
             test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
         except Exception:
             logger.error("Test set not found or empty. Skipping test evaluation.")
