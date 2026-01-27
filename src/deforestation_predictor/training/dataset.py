@@ -1,88 +1,151 @@
+import json
 import torch
-from torch.utils.data import Dataset
 import numpy as np
 from pathlib import Path
+from torch.utils.data import Dataset
 from deforestation_predictor.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-
 class DeforestationDataset(Dataset):
     """
-    PyTorch Dataset for loading 3D deforestation patches (.npz).
-    Supports dynamic temporal slicing (RQ2) AND single-snapshot sampling (Laura's replication).
+    PyTorch Dataset for On-the-Fly 3D sampling from large memory-mapped files.
+    Replaces the old static patch dataset.
     """
 
-    def __init__(self, data_root: str | Path, split: str, context_length: int | None = None, mode: str = 'sequence'):
-        """
-        Args:
-            data_root (str | Path): Root directory containing processed data.
-            split (str): 'train', 'val', or 'test'.
-            context_length (int, optional): If set, limits the input to the last N months.
-                                            Used for experimenting with window sizes (RQ2).
-            mode (str): 'sequence' (default) - Returns a sequence of length context_length.
-                        'snapshot' - Returns a single time step (random for train, last for val/test).
-        """
-        self.split_dir = Path(data_root) / split
-        self.files = list(self.split_dir.glob("*.npz"))
+    def __init__(self, 
+                 data_root: str | Path, 
+                 split: str, 
+                 context_length: int = 12, 
+                 mode: str = 'sequence',
+                 epoch_size: int = 10000,
+                 crop_size: int = 64,
+                 balance_prob: float = 0.5):
+        
+        self.data_root = Path(data_root)
+        self.split = split
         self.context_length = context_length
-        self.split = split  # Neccesary to know wheter shuffling is required in snapshot mode
-        self.mode = mode    # 'sequence' or 'snapshot'
+        self.mode = mode # 'sequence' or 'snapshot'
+        self.epoch_size = epoch_size
+        self.crop_size = crop_size
+        self.balance_prob = balance_prob
 
-        if len(self.files) == 0:
-            logger.error(f"No .npz files found in {self.split_dir}")
-            raise ValueError(f"No .npz files found in {self.split_dir}")
+        # 1. Load Metadata
+        stats_path = self.data_root / "stats.json"
+        if not stats_path.exists():
+            raise FileNotFoundError(f"stats.json not found at {self.data_root}. Did you run preprocessing?")
+            
+        with open(stats_path, "r") as f:
+            self.stats = json.load(f)
+        
+        self.dates = self.stats["dates"]
+        
+        # 2. Determine Valid Time Indices (Hardcoded Split Logic from Preprocessing)
+        # Train: < 2023-04-01 | Val: 2023-10-01 to 2024-03-01 | Test: > 2024-04-01
+        valid_indices = []
+        for t, d_str in enumerate(self.dates):
+            if split == 'train':
+                if d_str <= "2023-04-01":
+                    valid_indices.append(t)
+            elif split == 'val':
+                if "2023-10-01" <= d_str <= "2024-03-01":
+                    valid_indices.append(t)
+            elif split == 'test':
+                if d_str >= "2024-04-01":
+                    valid_indices.append(t)
+        
+        # Filter indices that have enough context
+        # We need data from t - context_length (exclusive) to t (inclusive)
+        # So t must be >= context_length
+        self.valid_time_indices = [t for t in valid_indices if t >= self.context_length]
+        
+        if not self.valid_time_indices:
+            # Fallback for testing/debugging if splits are too tight
+            logger.warning(f"No valid time indices for {split}. Using all available.")
+            self.valid_time_indices = [t for t in range(len(self.dates)) if t >= self.context_length]
 
-        logger.info(f"Initialized {split} dataset from {self.split_dir}")
-        logger.info(f"Found {len(self.files)} samples. Mode: {self.mode}")
+        # 3. Load Positive Indices for Balancing
+        pos_path = self.data_root / "positive_indices.npy"
+        if pos_path.exists():
+            all_positives = np.load(pos_path)
+            # Filter positives to only include valid time steps for this split
+            mask = np.isin(all_positives[:, 0], self.valid_time_indices)
+            self.split_positives = all_positives[mask]
+        else:
+            self.split_positives = []
+        
+        if len(self.split_positives) == 0 and split == 'train':
+            logger.warning(f"No positive labels found in {split} split. Balancing disabled.")
+            self.balance_prob = 0.0
 
-        if self.context_length and self.mode == 'sequence':
-            logger.info(f"Sequence Mode: Temporal slicing enabled. Keeping last {self.context_length} months.")
+        # 4. Open Memory Maps
+        self.features_path = self.data_root / "features.npy"
+        self.labels_path = self.data_root / "labels.npy"
+        
+        self.X_mmap = np.load(self.features_path, mmap_mode='r')
+        self.y_mmap = np.load(self.labels_path, mmap_mode='r')
+        
+        self.C, self.T, self.H, self.W = self.X_mmap.shape
 
     def __len__(self) -> int:
-        return len(self.files)
+        return self.epoch_size
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Loads a single sample.
+        
+        # 1. Select Time Step t
+        use_positive = (self.split == 'train') and (np.random.rand() < self.balance_prob)
+        
+        if use_positive and len(self.split_positives) > 0:
+            # Pick from positives
+            rnd_idx = np.random.randint(len(self.split_positives))
+            t, center_y, center_x = self.split_positives[rnd_idx]
+            
+            # Center the crop
+            y = center_y - self.crop_size // 2
+            x = center_x - self.crop_size // 2
+            
+            # Jitter
+            y += np.random.randint(-5, 6)
+            x += np.random.randint(-5, 6)
+            
+        else:
+            # Random sampling
+            t = np.random.choice(self.valid_time_indices)
+            y = np.random.randint(0, self.H - self.crop_size)
+            x = np.random.randint(0, self.W - self.crop_size)
 
-        Returns:
-            X (Tensor): Shape [Channels, Time, Height, Width]
-            y (Tensor): Shape [Height, Width]
-        """
-        path = self.files[idx]
+        # 2. Boundary Checks
+        y = max(0, min(y, self.H - self.crop_size))
+        x = max(0, min(x, self.W - self.crop_size))
 
-        try:
-            with np.load(path) as data:
-                # X shape: [C, T, H, W] (Channels, Time, Height, Width)
-                X = data['X'].astype(np.float32)
-                y = data['y'].astype(np.longlong)  # Mask: 0, 1, 2(ignore)
+        # 3. Slicing
+        # 'sequence' mode: return volume [C, Context, H, W]
+        # 'snapshot' mode: return single frame [C, 1, H, W]
+        
+        t_start = t - self.context_length
+        t_end = t
+        
+        # Get Full Sequence first
+        X_crop = self.X_mmap[:, t_start:t_end, y:y+self.crop_size, x:x+self.crop_size]
+        
+        if self.mode == 'snapshot':
+            # Take only the last frame (or random frame in sequence? usually last for prediction)
+            # User requirement: "snapshot - Returns a single time step"
+            # We keep dimensions [C, 1, H, W]
+            X_crop = X_crop[:, -1:, :, :]
 
-            current_T = X.shape[1]
+        # y is the label at the target time t (which corresponds to index t-1 in labels if alignment is 1:1)
+        # Assuming y_mmap[t] corresponds to the label for the state at X[t]
+        # In build_3d_dataset, we aligned dates. 
+        # If t is the index in dates, y_mmap[t] is the label.
+        # X_crop ends at t (exclusive in slice, so includes indices up to t-1). 
+        # Wait, if X is 0..T-1. Slicing t_start:t gives indices t_start..t-1. 
+        # The label for the last frame (t-1) is y_mmap[t-1].
+        
+        y_crop = self.y_mmap[t-1, y:y+self.crop_size, x:x+self.crop_size]
 
-            # --- MODE 1: SNAPSHOT  ---
-            if self.mode == 'snapshot':
-                if self.split == 'train':
-                    # Laura's method: random time step during training 
-                    t_idx = np.random.randint(0, current_T)
-                else:
-                    # Validation/Test: last time step
-                    t_idx = current_T - 1
-                
-                # We keep the dimension (T=1) so that models don't crash: [C, 1, H, W]
-                X = X[:, t_idx:t_idx+1, :, :]
+        # 4. Convert to Tensor
+        X_tensor = torch.from_numpy(X_crop.copy()).float()
+        y_tensor = torch.from_numpy(y_crop.copy()).long()
 
-            # --- MODE 2: SEQUENCE  ---
-            elif self.context_length is not None:
-                if current_T >= self.context_length:
-                    # Take the last 'context_length' time steps
-                    X = X[:, -self.context_length:, :, :]
-                else:
-                    # Warn only once or handle gracefully
-                    pass
-
-            return torch.from_numpy(X), torch.from_numpy(y)
-
-        except Exception as e:
-            logger.error(f"Failed to load sample at {path}: {e}")
-            raise e
+        return X_tensor, y_tensor

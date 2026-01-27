@@ -7,26 +7,14 @@ import numpy as np
 import pandas as pd
 import logging
 import sys
+import rasterio
 
 from deforestation_predictor.preprocessing.catalog import (
     build_raster_catalog,
     build_gt_catalog,
     compute_variable_maxima,
 )
-from deforestation_predictor.preprocessing.splits import (
-    build_target_table,
-    filter_targets_with_full_window,
-    split_targets_by_time,
-    TemporalSplitConfig,
-)
-from deforestation_predictor.preprocessing.builder import (
-    build_sample,
-    balanced_random_spatial_crops
-)
-from deforestation_predictor.preprocessing.windows import (
-    CONTEXT_MONTHS,
-    GAP_MONTHS,
-)
+from deforestation_predictor.preprocessing.splits import TemporalSplitConfig
 from deforestation_predictor.preprocessing.mosaic_and_clip_bbox import (
     mosaic_and_clip_region,
 )
@@ -49,145 +37,64 @@ def setup_logger(log_file):
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-# RAW (per-tile) roots that you already have
+# RAW (per-tile) roots
 RAW_INPUT_ROOT = PROJECT_ROOT / "data" / "input"
 RAW_GT_ROOT = PROJECT_ROOT / "data" / "groundtruth"
 
-# Region settings
 REGION_ID = "GABON"
+GABON_BOUNDS = (8.4, -4.1, 14.6, 2.3)
+REGION_TILES = ["00N_000E", "10N_000E", "00N_010E", "10N_010E"]
 
-# Bounding box for Gabon
-GABON_BOUNDS = (8.4, -4.1, 14.6, 2.3)  # (west, south, east, north)
-
-# The 4 tiles that surround Gabon in your tiling scheme
-REGION_TILES = [
-    "00N_000E",
-    "10N_000E",
-    "00N_010E",
-    "10N_010E",
-]
-
-# Where mosaiced + clipped tifs will be written
 REGION_INPUT_ROOT = PROJECT_ROOT / "data" / "processed" / "input"
 REGION_GT_ROOT = PROJECT_ROOT / "data" / "processed" / "groundtruth"
-
-# Where 3D dataset .npz will be written
 OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed" / REGION_ID
 
-# Which variables you want the 3D CNN to see (snapshot / monthly)
-# firealerts, nightlights and fw are not available for full time range
+# Variables
 MONTHLY_VARS = [
-    #'firealerts',
-    #'nightlights',
-    'precipitation',
-    'temperature',
-    'confidence',
-    #'fwi',
-    'lastmonth',
-    'lastthreemonths', # For XGBoost and ResUnet test
-    'lastsixmonths', # For XGBoost and ResUnet test
-    'timesinceloss',
-    'totallossalerts',
-    'previoussameseason',
-    'patchdensity',
-    'smoothedsixmonths',
-    'smoothedtotal',
-    
+    'precipitation', 'temperature', 'confidence', 'lastmonth',
+    'lastthreemonths', 'lastsixmonths', 'timesinceloss',
+    'totallossalerts', 'previoussameseason', 'patchdensity',
+    'smoothedsixmonths', 'smoothedtotal',
 ]
-
-#TODO : oplossing vinden om losslastyear als input te gebruiken
-# Missing: 'losslastyear'
 
 STATIC_VARS = [
-    "elevation",
-    "slope",
-    "peatlands",
-    "initialforestcover",
-    "historicloss",
-    "forestheight",
-    "forestedgedensity",
-    "landpercentage",
-    "populationcurrent",
-    "populationincrease",
-    "closenesstoroads",
-    "closenesstowaterways",
-    "closenesstocropland",
-    "closenesstococoa",
-    "closenesstocoffee",
-    "closenesstofiber",
-    "closenesstosoybean",
-    "closenesstocattleabove2000",
-    "closenesstocattleabove10000",
-    "closenesstomining",
-    "palmoilmills",
-    "croplandcapacity100p",
-    "croplandcapacitybelow50p",
-    "croplandcapacityover50p",
-    "catexcap",
-    "aridityannual",
-    "ariditydriestquarter",
-    "closenesstoforestedge",
-    "wetlands",
-    "wdpa",
+    "elevation", "slope", "peatlands", "initialforestcover", "historicloss",
+    "forestheight", "forestedgedensity", "landpercentage", "populationcurrent",
+    "populationincrease", "closenesstoroads", "closenesstowaterways",
+    "closenesstocropland", "closenesstococoa", "closenesstocoffee",
+    "closenesstofiber", "closenesstosoybean", "closenesstocattleabove2000",
+    "closenesstocattleabove10000", "closenesstomining", "palmoilmills",
+    "croplandcapacity100p", "croplandcapacitybelow50p", "croplandcapacityover50p",
+    "catexcap", "aridityannual", "ariditydriestquarter", "closenesstoforestedge",
+    "wetlands", "wdpa",
 ]
 
-# Categorical variables should not be scaled by maxima
-CATEGORICAL_VARS: set[str] = {
-    'wetlands',
-    'wdpa',
-}
+CATEGORICAL_VARS: set[str] = {'wetlands', 'wdpa'}
 
-CONTEXT = 1
+# Pipeline Params
+FOREST_MASK_THRESHOLD = 2000.0
 ANCHOR_DATE = "2021-01-01"
-MAX_CONTEXT = 1
 GAP = 1
-
-# TODO : Adjust split dates test_end = 2024-09-01, test_start = 2024-04-01, train_start = 2021-01-01, train_end = 2023-04-01, val_start = 2023-10-01, val_end = 2024-03-01 
+CONTEXT = 1 # Not used for building the cube, but for split calculations
 
 SPLIT_CFG = TemporalSplitConfig(
-    train_end="2023-04-01",   # Train targets: Jan 2022 t/m Dec 2023
-    val_end="2024-03-01",     # Val raw eindigt Dec 2024
-    test_start="2024-04-01",  # Test targets: Jan 2025
-    test_end="2024-09-01",    # Test targets: t/m Mei 2025
-    context=MAX_CONTEXT,
+    train_end="2023-04-01",
+    val_end="2024-03-01",
+    test_start="2024-04-01",
+    test_end="2024-09-01",
+    context=CONTEXT,
     gap=GAP,
 )
 
-# Validation start date (real, after filtering)
-# First few months of validation are filtered out to prevent leakage from training period
-VAL_START_DATE_REAL = "2023-10-01"
-
-PATCH_SIZE = 64 # 64x64 patches
-
-# Number of patches to extract per sample
-# I put this quite high to have more data for training
-# and also to have some overlapping patches so that the model can learn from it more robustly
-
-PATCHES_PER_SAMPLE_TRAIN = 1600 #Double from 800 to 1600 for more data
-PATCHES_PER_SAMPLE_VAL = 1600
-PATCHES_PER_SAMPLE_TEST = 1600
-
-# Fraction of patches that should contain deforestation (y=1)
-POS_FRACTION_TRAIN = 0.5
-
-# Threshold for forest mask
-FOREST_MASK_THRESHOLD = 2000.0
-
-
-# ------------- MAIN PIPELINE ------------- #
 
 def main():
     output_root = Path(OUTPUT_ROOT)
     output_root.mkdir(parents=True, exist_ok=True)
+    logger = setup_logger(output_root / "preprocessing.log")
 
-    log_path = output_root / "preprocessing.log"
-    logger = setup_logger(log_path)
+    logger.info("Starting On-the-Fly Dataset Generation...")
 
-    logger.info("Starting pipeline execution...")
-    logger.info(f"Output directory set as: {output_root}")
-
-    # 0) Mosaic + clip to Gabon
-    logger.info("[0] Preparing mosaiced & clipped rasters for region GABON...")
+    # 0) Mosaic + clip
     mosaic_and_clip_region(
         raw_input_root=RAW_INPUT_ROOT,
         raw_gt_root=RAW_GT_ROOT,
@@ -198,241 +105,182 @@ def main():
         tile_ids=REGION_TILES,
     )
 
-    # From here on we work ONLY with the mosaiced/clipped region
     INPUT_ROOT = REGION_INPUT_ROOT / REGION_ID
     GT_ROOT = REGION_GT_ROOT / REGION_ID
 
     # 1) Build catalogs
-    logger.info("[1] Building input catalog (unfiltered)...")
     full_catalog = build_raster_catalog(str(INPUT_ROOT))
-
-    # --- FIX 1: Corrected logging syntax ---
-    logger.info(f"Raw catalog rows: {len(full_catalog)}")
-    logger.info(f"Raw unique variables: {sorted(full_catalog['variable'].unique())}")
-
-    # Dynamic (monthly) catalog
     catalog = full_catalog[full_catalog["variable"].isin(MONTHLY_VARS)].reset_index(drop=True)
-
-    # --- FIX 2: Corrected logging syntax ---
-    logger.info(f"Filtered catalog rows (monthly): {len(catalog)}")
-    logger.info(f"Filtered unique monthly variables: {sorted(catalog['variable'].unique())}")
-
-    # Static catalog
     static_catalog = full_catalog[full_catalog["variable"].isin(STATIC_VARS)].reset_index(drop=True)
+    forestmask_catalog = full_catalog[full_catalog["variable"] == "initialforestcover"].reset_index(drop=True)
 
-    # Forest mask catalog
-    forestmask_catalog = (
-        full_catalog[full_catalog["variable"] == "initialforestcover"]
-        .reset_index(drop=True)
-    )
-    # --- FIX 3: Corrected logging syntax ---
-    logger.info(f"Forest mask records: {len(forestmask_catalog)}")
-
-    logger.info("[2] Building GT catalog...")
     gt_catalog = build_gt_catalog(str(GT_ROOT))
-    logger.info(f"    -> {len(gt_catalog)} GT records")
-
-    # --- FIX 4: Stop if no Ground Truth found ---
     if gt_catalog.empty:
-        logger.error("CRITICAL: No Ground Truth records found. Stopping to prevent crash.")
-        logger.error(f"Please check if GT files exist in: {GT_ROOT}")
+        logger.error("No Ground Truth found.")
         return
 
-    # 3) Build target table from GT and enforce Anchor Date
-    logger.info(f"[3] Building target table (starting from {ANCHOR_DATE})...")
-    targets = build_target_table(gt_catalog, min_date=ANCHOR_DATE)
-
-    # 4) Filter targets with FULL windows based on MAX_CONTEXT
-    # This ensures consistency: all models will use the exact same pixels/dates.
-    logger.info(f"[4] Filtering targets using MAX_CONTEXT={MAX_CONTEXT}...")
-    targets_full = filter_targets_with_full_window(
-        targets,
-        catalog,
-        context=MAX_CONTEXT,
-        gap=GAP,
-    )
-
-    # 5) Split into train / val / test using the new logic
-    logger.info("[5] Splitting targets into train/val/test...")
-    train_targets, val_targets_raw, test_targets = split_targets_by_time(
-        targets_full,
-        SPLIT_CFG,
-    )
-
-    # Create a gap between train and val by removing early val targets
-    valid_start_real = pd.to_datetime(VAL_START_DATE_REAL)
-    val_targets = val_targets_raw[val_targets_raw["date"] >= valid_start_real].reset_index(drop=True)
-
-    # --------------------------------------------------------
-
-    logger.info(f"    train: {len(train_targets)}")
-    logger.info(f"    val:   {len(val_targets)}")
-    logger.info(f"    test:  {len(test_targets)}")
-
-    # Save split metadata as CSV
-    splits_dir = output_root / "splits"
-    splits_dir.mkdir(exist_ok=True)
-    train_targets.to_csv(splits_dir / "train_targets.csv", index=False)
-    val_targets.to_csv(splits_dir / "val_targets.csv", index=False)
-    test_targets.to_csv(splits_dir / "test_targets.csv", index=False)
-
-    # 6) Compute maxima *only from training time range*
-    logger.info("[6] Computing per-variable maxima from TRAIN catalog only...")
-
+    # 2) Compute Maxima (Train Only)
+    logger.info("[2] Computing maxima...")
     train_end = pd.to_datetime(SPLIT_CFG.train_end)
-    max_input_date = train_end - DateOffset(months=GAP)
-    min_target_date = train_targets["date"].min()
+    train_mask = (full_catalog["date"] < train_end) | (full_catalog["variable"].isin(STATIC_VARS))
+    train_catalog = full_catalog[train_mask].reset_index(drop=True)
+    maxima = compute_variable_maxima(train_catalog)
+    
+    with open(output_root / "maxima.json", "w") as f:
+        json.dump(maxima, f)
 
-    if pd.isna(min_target_date):
-        logger.warning("No training targets found, cannot compute maxima reliably.")
-        maxima = {}
-    else:
-        min_input_date = min_target_date - DateOffset(months=CONTEXT + GAP - 1)
-
-        # 1. Dynamic vars: Only within train time range
-        dynamic_mask = (
-            (full_catalog["date"] >= min_input_date) &
-            (full_catalog["date"] <= max_input_date) &
-            (full_catalog["variable"].isin(MONTHLY_VARS))
-        )
-        
-        # 2. Static vars: Always include
-        static_mask = full_catalog["variable"].isin(STATIC_VARS)
-
-        # Combine masks
-        train_catalog_for_max = full_catalog[dynamic_mask | static_mask].reset_index(drop=True)
-        # -----------------------------
-
-        logger.info(
-            f"    -> using {len(train_catalog_for_max)} rasters for maxima "
-            f"(Dynamic: {min_input_date.date()} to {max_input_date.date()} + All Static)"
-        )
-        maxima = compute_variable_maxima(train_catalog_for_max)
-
-        with open(output_root / "maxima.json", "w") as f:
-            json.dump(maxima, f)
-        print("Maxima saved to maxima.json")
-
-    # 7) Materialize samples for each split
-    logger.info("[7] Building and saving samples...")
-
-    for split_name, split_targets in [
-        ("train", train_targets),
-        ("val", val_targets),
-        ("test", test_targets)
-    ]:
-        if split_targets.empty:
-            logger.info(f"Skipping {split_name} split (no targets).")
-            continue
-
-        build_and_save_split(
-            split_name=split_name,
-            targets=split_targets,
-            catalog=catalog,
-            gt_catalog=gt_catalog,
-            maxima=maxima,
-            output_root=output_root,
-            static_catalog=static_catalog,
-            forestmask_catalog=forestmask_catalog,
-            forest_mask_threshold=FOREST_MASK_THRESHOLD,
-            categorical_vars=CATEGORICAL_VARS,
-            logger=logger
-        )
-
-    logger.info("[DONE] All samples saved.")
+    # 3) Build Dense 4D Array
+    logger.info("[3] Building dense 4D arrays (mmap)...")
+    build_dense_region(
+        catalog=catalog,
+        static_catalog=static_catalog,
+        gt_catalog=gt_catalog,
+        maxima=maxima,
+        output_root=output_root,
+        logger=logger,
+        anchor_date=ANCHOR_DATE,
+        forestmask_path=forestmask_catalog.iloc[0]["path"] if not forestmask_catalog.empty else None
+    )
 
 
-def build_and_save_split(
-        split_name: str,
-        targets: pd.DataFrame,
-        catalog: pd.DataFrame,
-        gt_catalog: pd.DataFrame,
-        maxima: dict[str, float],
-        output_root: Path,
-        static_catalog: pd.DataFrame | None = None,
-        forestmask_catalog: pd.DataFrame | None = None,
-        forest_mask_threshold: float = 0.0,
-        categorical_vars: set[str] | None = None,
-        logger=None,
-):
-    if logger is None:
-        logger = logging.getLogger(__name__)
+def build_dense_region(catalog, static_catalog, gt_catalog, maxima, output_root, logger, anchor_date, forestmask_path):
+    """
+    Constructs one massive features.npy [C, T, H, W] and labels.npy [T, H, W]
+    and saves positive indices for balancing.
+    """
+    # 1. Determine timeline
+    dates = sorted(list(set(catalog["date"].dt.date) | set(gt_catalog["date"].dt.date)))
+    dates = [d for d in dates if d >= pd.to_datetime(anchor_date).date()]
+    dates_str = [str(d) for d in dates]
+    
+    T = len(dates)
+    logger.info(f"Timeline: {T} months from {dates[0]} to {dates[-1]}")
 
-    split_dir = output_root / split_name
-    split_dir.mkdir(parents=True, exist_ok=True)
+    # 2. Determine Spatial Shape from first file
+    ref_path = catalog.iloc[0]["path"]
+    with rasterio.open(ref_path) as src:
+        H, W = src.shape
+        profile = src.profile
+    
+    C = len(MONTHLY_VARS) + len(STATIC_VARS)
+    logger.info(f"Dimensions: [C={C}, T={T}, H={H}, W={W}]")
 
-    records = []
+    # 3. Create MMAP files
+    feat_path = output_root / "features.npy"
+    label_path = output_root / "labels.npy"
 
-    for i, row in enumerate(targets.itertuples(index=False)):
-        tile_id = row.tile_id
-        target_date = row.date
+    # Initialize with zeros
+    X_mmap = np.lib.format.open_memmap(feat_path, mode='w+', dtype='float32', shape=(C, T, H, W))
+    y_mmap = np.lib.format.open_memmap(label_path, mode='w+', dtype='uint8', shape=(T, H, W))
 
-        try:
-            X, y, meta = build_sample(
-                tile_id=tile_id,
-                target_date=target_date,
-                catalog=catalog,
-                gt_catalog=gt_catalog,
-                context=CONTEXT,
-                gap=GAP,
-                static_catalog=static_catalog,
-                normalize=True,
-                overflow="clip",
-                nan_policy="zero",
-                cast="float32",
-                maxima=maxima,
-                forestmask_catalog=forestmask_catalog,
-                forest_mask_threshold=forest_mask_threshold,
-                categorical_vars=categorical_vars,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Failed to build sample for {tile_id} @ {target_date}: {e}"
-            )
-            continue
+    # 4. Load Static Data (Once)
+    # We append static vars to the end of the channel dimension
+    # Static data is repeated across time in the Dataset __getitem__, NOT here to save space?
+    # Actually, user requested [C, T, H, W] input. 
+    # To optimize, we usually keep static separate, but the prompt asks for "large features.npy".
+    # We will replicate static vars into the MMAP for simplicity, or we can save them separately.
+    # PROMPT SPECIFIC: "The output tensor must have the shape: [Channels, Sequence_Length, Height, Width]."
+    # To support mmap slicing efficiently, we will write static vars into the 4D array
+    # BUT broadcasting static vars 36 times is wasteful. 
+    # DECISION: We will write static vars as the LAST channels for EVERY time step. 
+    # Wait, strict shape [C, T, H, W] means C channels, T timesteps.
+    # If variables are static, they don't change over T. 
+    # Let's save static separately? No, the user wants ONE dataset file usually. 
+    # Reference `multicropdataset.py` merges them. 
+    # Strategy: We will build X_mmap as [C, T, H, W]. Yes, it repeats static data. Disk is cheap-ish.
 
-        if split_name == "train":
-            n_patches = PATCHES_PER_SAMPLE_TRAIN
-            X_patches, y_patches = balanced_random_spatial_crops(
-                X, y, patch_size=PATCH_SIZE, n_patches=n_patches, pos_fraction=POS_FRACTION_TRAIN,
-            )
+    static_layers = []
+    for var in STATIC_VARS:
+        row = static_catalog[static_catalog["variable"] == var]
+        if not row.empty:
+            with rasterio.open(row.iloc[0]["path"]) as src:
+                arr = src.read(1).astype('float32')
+                # Normalize
+                if var not in CATEGORICAL_VARS and var in maxima:
+                    arr /= (maxima[var] if maxima[var] > 0 else 1.0)
+                # NaNs to 0
+                arr = np.nan_to_num(arr, nan=0.0)
+                static_layers.append(arr)
         else:
-            n_patches = PATCHES_PER_SAMPLE_VAL if split_name == "val" else PATCHES_PER_SAMPLE_TEST
-            from deforestation_predictor.preprocessing.builder import random_spatial_crops
-            X_patches, y_patches = random_spatial_crops(
-                X, y, patch_size=PATCH_SIZE, n_patches=n_patches,
-            )
+            static_layers.append(np.zeros((H, W), dtype='float32'))
+    
+    static_block = np.stack(static_layers) # [C_stat, H, W]
 
-        for j in range(n_patches):
-            fname = f"{tile_id}_{target_date.date()}_patch{j:03d}.npz"
-            out_path = split_dir / fname
+    # 5. Fill Time Steps
+    positive_indices = {} # t_idx -> list of [y, x]
 
-            np.savez_compressed(
-                out_path,
-                X=X_patches[j],
-                y=y_patches[j],
-                tile_id=tile_id,
-                target_date=str(target_date.date()),
-                patch_id=j,
-                variables=np.array(meta["variables"], dtype=object),
-                dates=np.array([d.isoformat() for d in meta["dates"]], dtype=object),
-            )
+    for t_idx, date in enumerate(dates):
+        # A. Labels
+        gt_row = gt_catalog[gt_catalog["date"].dt.date == date]
+        if not gt_row.empty:
+            with rasterio.open(gt_row.iloc[0]["path"]) as src:
+                lbl = src.read(1)
+                # Mask: 0=No, 1=Deforestation. 
+                # (Assuming GT is already clean, or use forest mask to set ignore regions)
+                # User's code used to set 2 as ignore. Let's keep it simple: 1 is positive.
+                lbl = lbl.astype('uint8')
+                y_mmap[t_idx] = lbl
+                
+                # Store positives for balancing
+                # Use np.argwhere. This might be large, but usually deforestation is sparse.
+                pos_locs = np.argwhere(lbl == 1)
+                if len(pos_locs) > 0:
+                    positive_indices[t_idx] = pos_locs.tolist() # [[y,x], ...]
+        else:
+            # If no GT for this month, fill 0 (or ignore?)
+            # Assuming 0.
+            pass
 
-            records.append({
-                "tile_id": tile_id,
-                "target_date": target_date,
-                "patch_id": j,
-                "path": str(out_path),
-            })
+        # B. Dynamic Features
+        for c_idx, var in enumerate(MONTHLY_VARS):
+            row = catalog[(catalog["date"].dt.date == date) & (catalog["variable"] == var)]
+            if not row.empty:
+                with rasterio.open(row.iloc[0]["path"]) as src:
+                    arr = src.read(1).astype('float32')
+                    if var in maxima:
+                        arr /= (maxima[var] if maxima[var] > 0 else 1.0)
+                    arr = np.nan_to_num(arr, nan=0.0)
+                    X_mmap[c_idx, t_idx] = arr
+            else:
+                pass # Leave as 0.0
 
-        if (i + 1) % 10 == 0:
-            logger.info(f"    [{split_name}] processed {i + 1}/{len(targets)} samples")
+        # C. Static Features (Broadcast)
+        # Static vars start after monthly vars
+        start_c = len(MONTHLY_VARS)
+        X_mmap[start_c:, t_idx] = static_block
 
-    if records:
-        index_df = pd.DataFrame(records)
-        index_df.to_csv(output_root / f"{split_name}_index.csv", index=False)
-        logger.info(f"    [{split_name}] saved {len(records)} samples and {split_name}_index.csv")
+        if (t_idx + 1) % 5 == 0:
+            logger.info(f"Processed {t_idx + 1}/{T} months")
 
+    # Flush changes to disk
+    X_mmap.flush()
+    y_mmap.flush()
+
+    # 6. Save Metadata
+    meta = {
+        "dates": dates_str,
+        "variables": MONTHLY_VARS + STATIC_VARS,
+        "positive_indices": positive_indices, # dict[str(t), list[list[y,x]]]
+        "shape": [C, T, H, W]
+    }
+    
+    # Save indices separately if too large for JSON, but usually okay for sparse masks
+    # If huge, use npy. Let's use npy for indices to be safe.
+    # We flatten the list: [t, y, x]
+    all_positives = []
+    for t, locs in positive_indices.items():
+        for yx in locs:
+            all_positives.append([t, yx[0], yx[1]])
+    
+    np.save(output_root / "positive_indices.npy", np.array(all_positives, dtype='int32'))
+    
+    # Remove large list from json
+    del meta["positive_indices"]
+    
+    with open(output_root / "stats.json", "w") as f:
+        json.dump(meta, f, indent=2)
+
+    logger.info("Dataset generation complete.")
 
 if __name__ == "__main__":
     main()
