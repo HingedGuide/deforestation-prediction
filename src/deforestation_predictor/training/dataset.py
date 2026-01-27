@@ -67,7 +67,7 @@ class DeforestationDataset(Dataset):
                     t_idx = np.random.randint(0, current_T)
                 else:
                     # Validation/Test: last time step
-                    t_idx = -1
+                    t_idx = current_T - 1
                 
                 # We keep the dimension (T=1) so that models don't crash: [C, 1, H, W]
                 X = X[:, t_idx:t_idx+1, :, :]

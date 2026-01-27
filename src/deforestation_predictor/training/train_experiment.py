@@ -34,7 +34,7 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
 
     with torch.no_grad():
         logits = model(X)
-        probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+        probs = torch.sigmoid(logits).squeeze(1)
 
     for i in range(min(num_samples, len(X))):
         img_t = X[i, 0, -1, :, :].cpu().numpy()
@@ -96,19 +96,24 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
         X, y = X.to(device), y.to(device)
 
         # Create weight mask (ones for now, or use balance logic)
-        weight_mask = torch.ones_like(y, dtype=torch.float32).to(device)
+        weight_mask = (y != 2).float().to(device)
 
         optimizer.zero_grad()
         logits = model(X)
-        
-        loss = criterion(logits, y, weight_mask)
+
+        logits = logits.squeeze(1)
+
+        y_clean = y.clone()
+        y_clean[y == 2] = 0  # Temporarily set ignore to 0
+
+        loss = criterion(logits, y_clean, weight_mask)
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
 
         with torch.no_grad():
-            probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+            probs = torch.sigmoid(logits)
             mask = y != 2
             if mask.sum() > 0:
                 all_preds.append(probs[mask].cpu().numpy())
@@ -150,13 +155,20 @@ def validate(model, loader, criterion, device, return_preds=False):
     for X, y in tqdm(loader, desc="Validation", leave=False):
         X, y = X.to(device), y.to(device)
         
-        weight_mask = torch.ones_like(y, dtype=torch.float32).to(device)
+        weight_mask = (y != 2).float().to(device)
         
         logits = model(X)
-        loss = criterion(logits, y, weight_mask)
+
+        logits = logits.squeeze(1)
+
+        y_clean = y.clone()
+        y_clean[y == 2] = 0  # Temporarily set ignore to 0
+
+        loss = criterion(logits, y_clean, weight_mask)
         total_loss += loss.item()
 
-        probs = torch.softmax(logits, dim=1)[:, 1, :, :]
+        probs = torch.sigmoid(logits)
+
         mask = y != 2
 
         if mask.sum() > 0:
@@ -240,7 +252,7 @@ def main():
         if args.model_type == "3dcnn":
             model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "resunet":
-            model = ResUNet(in_channels=in_channels, time_depth=time_depth).to(device)
+            model = ResUNet(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
         elif args.model_type == "convlstm":
             model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "vivit":
