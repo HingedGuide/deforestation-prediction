@@ -241,6 +241,7 @@ def main():
     parser = argparse.ArgumentParser(description="Deep Learning Training Loop")
     parser.add_argument("--data_root", type=str, required=True, help="Path to processed 3D data")
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epoch_size", type=int, default=50000, help="Number of samples per epoch")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
@@ -269,8 +270,19 @@ def main():
 
     try:
         # 1. Load Datasets
-        train_ds = DeforestationDataset(args.data_root, "train", context_length=args.context_months, mode=args.mode)
-        val_ds = DeforestationDataset(args.data_root, "val", context_length=args.context_months, mode=args.mode)
+        train_ds = DeforestationDataset(
+            args.data_root, 
+            "train", 
+            context_length=args.context_months, 
+            mode=args.mode, 
+            epoch_size=args.epoch_size)
+        
+        val_ds = DeforestationDataset(
+            args.data_root,
+            "val", 
+            context_length=args.context_months, 
+            mode=args.mode, epoch_size=args.epoch_size // 2
+            )
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
