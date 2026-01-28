@@ -162,24 +162,24 @@ class ResidualBlock3D(nn.Module):
 
 
 class ResUNet(nn.Module):
-    def __init__(self, in_channels, time_depth, num_classes=2, filters=[64, 128, 256, 512]):
+    def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
         super(ResUNet, self).__init__()
 
         # Total input channels = variables * time_steps (Early Fusion)
         input_dim = in_channels * time_depth
         
         if len(filters) < 4:
-            filters = [64, 128, 256, 512]
+            filters = [32, 64, 128, 256]
 
         # --- Encoder ---
         self.input_layer = nn.Sequential(
-            nn.Conv2d(input_dim, filters[0], kernel_size=7, stride=2, padding=0),
+            nn.Conv2d(input_dim, filters[0], kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(filters[0]),
             nn.ReLU(),
             nn.Conv2d(filters[0], filters[0], kernel_size=3, padding=1),
         )
         self.input_skip = nn.Sequential(
-            nn.Conv2d(input_dim, filters[0], kernel_size=7, stride=2, padding=0)
+            nn.Conv2d(input_dim, filters[0], kernel_size=3, stride=1, padding=1)
         )
         
         self.residual_conv_1 = ResidualConv(filters[0], 7, filters[1], 2, 1)

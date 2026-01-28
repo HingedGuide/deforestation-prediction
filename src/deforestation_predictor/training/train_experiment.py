@@ -8,6 +8,7 @@ from tqdm import tqdm
 from pathlib import Path
 from sklearn.metrics import precision_recall_curve, auc, precision_score, recall_score, fbeta_score
 
+# Ensure these match your actual file structure
 from deforestation_predictor.training.dataset import DeforestationDataset
 from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
 from deforestation_predictor.training.loss import WeightedFocalLoss, CombinedLoss
@@ -20,7 +21,6 @@ logger = setup_logger(__name__, log_file="training_experiment.log")
 def log_validation_visuals(model, loader, device, epoch, num_samples=4):
     """
     Logs input, ground truth, and prediction images to W&B.
-    Since inputs are 3D [C, T, H, W], we visualize the LAST time step.
     """
     model.eval()
     images_to_log = []
@@ -34,10 +34,21 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
 
     with torch.no_grad():
         logits = model(X)
-        probs = torch.sigmoid(logits).squeeze(1)
+        # Handle 1D channel output
+        if logits.shape[1] == 1:
+            probs = torch.sigmoid(logits).squeeze(1)
+        else:
+            probs = torch.sigmoid(logits[:, 0]) 
 
     for i in range(min(num_samples, len(X))):
-        img_t = X[i, 0, -1, :, :].cpu().numpy()
+        # VISUALIZATION FIX: Handle 4D or 5D input
+        # If [B, C, T, H, W], take last time step. If [B, C, H, W], take whole image.
+        if X.ndim == 5:
+            img_t = X[i, 0, -1, :, :].cpu().numpy()
+        else:
+            img_t = X[i, 0, :, :].cpu().numpy()
+
+        # Normalize for display
         img_min, img_max = img_t.min(), img_t.max()
         if img_max > img_min:
             img_t = (img_t - img_min) / (img_max - img_min)
@@ -46,6 +57,10 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
 
         gt_t = y[i].cpu().numpy()
         pred_t = probs[i].cpu().numpy()
+        
+        # FIX: Clean GT for visualization (map 255/garbage to 2 for 'Ignore')
+        gt_viz = gt_t.copy()
+        gt_viz[(gt_viz != 0) & (gt_viz != 1)] = 2
 
         images_to_log.append(wandb.Image(
             img_t,
@@ -55,7 +70,7 @@ def log_validation_visuals(model, loader, device, epoch, num_samples=4):
                     "class_labels": {0: "Forest", 1: "Deforestation"}
                 },
                 "ground_truth": {
-                    "mask_data": gt_t.astype(int),
+                    "mask_data": gt_viz.astype(int),
                     "class_labels": {0: "Forest", 1: "Deforestation", 2: "Ignore"}
                 }
             },
@@ -72,13 +87,13 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
     total_steps = len(loader) * args.epochs
     warmup_steps = len(loader) * args.warmup_epochs
 
+    # --- Custom Scheduler Logic (Kept as is) ---
     warmup_schedule = np.linspace(0, args.lr, warmup_steps)
     iters = np.arange(total_steps - warmup_steps)
     cosine_schedule = np.array([
         0 + 0.5 * (args.lr - 0) * (1 + math.cos(math.pi * t / (total_steps - warmup_steps)))
         for t in iters
     ])
-
     lr_schedule = np.concatenate((warmup_schedule, cosine_schedule))
 
     all_preds = []
@@ -95,29 +110,40 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
 
         X, y = X.to(device), y.to(device)
 
-        # Create weight mask (ones for now, or use balance logic)
-        weight_mask = (y != 2).float().to(device)
+        # --- FIX: STRICT MASKING ---
+        # Instead of (y != 2), we allow ONLY 0 and 1.
+        # This filters out 2 (Ignore) AND 255 (No Data).
+        valid_mask = (y == 0) | (y == 1)
+        
+        # Create weight mask for the Loss function
+        # Invalid pixels get weight 0.0
+        weight_mask = valid_mask.float().to(device)
 
         optimizer.zero_grad()
         logits = model(X)
-
         logits = logits.squeeze(1)
 
+        # --- FIX: CLEAN TARGETS FOR LOSS ---
+        # Set invalid pixels to 0 so the math doesn't explode (log(NaN)).
+        # The weight_mask will ensure these 0s don't affect the gradient.
         y_clean = y.clone()
-        y_clean[y == 2] = 0  # Temporarily set ignore to 0
+        y_clean[~valid_mask] = 0 
 
+        # Forward loss with weight mask
         loss = criterion(logits, y_clean, weight_mask)
+        
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
 
+        # --- FIX: METRICS ---
+        # Only collect valid pixels for Scikit-Learn (avoids multiclass error)
         with torch.no_grad():
             probs = torch.sigmoid(logits)
-            mask = y != 2
-            if mask.sum() > 0:
-                all_preds.append(probs[mask].cpu().numpy())
-                all_targets.append(y[mask].cpu().numpy())
+            if valid_mask.sum() > 0:
+                all_preds.append(probs[valid_mask].cpu().numpy())
+                all_targets.append(y[valid_mask].cpu().numpy())
 
         if step % 10 == 0:
             wandb.log({"train_batch_loss": loss.item()})
@@ -131,16 +157,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
     else:
         y_true = np.concatenate(all_targets)
         y_scores = np.concatenate(all_preds)
-        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-        train_auc = auc(recall, precision)
         
-        # --- Calculate Max F0.5 Score for Training ---
-        with np.errstate(divide='ignore', invalid='ignore'):
-            beta = 0.5
-            numerator = (1 + beta**2) * precision * recall
-            denominator = (beta**2 * precision) + recall
-            fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-        train_f05 = np.max(fbeta)
+        # Safety check for single class in batch
+        if len(np.unique(y_true)) < 2:
+            train_auc = 0.5
+            train_f05 = 0.0
+        else:
+            precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+            train_auc = auc(recall, precision)
+            
+            # --- Calculate Max F0.5 Score for Training ---
+            with np.errstate(divide='ignore', invalid='ignore'):
+                beta = 0.5
+                numerator = (1 + beta**2) * precision * recall
+                denominator = (beta**2 * precision) + recall
+                fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
+            train_f05 = np.max(fbeta)
 
     return avg_loss, train_auc, train_f05
 
@@ -155,45 +187,50 @@ def validate(model, loader, criterion, device, return_preds=False):
     for X, y in tqdm(loader, desc="Validation", leave=False):
         X, y = X.to(device), y.to(device)
         
-        weight_mask = (y != 2).float().to(device)
+        # --- FIX: STRICT MASKING ---
+        valid_mask = (y == 0) | (y == 1)
+        weight_mask = valid_mask.float().to(device)
         
         logits = model(X)
-
         logits = logits.squeeze(1)
 
         y_clean = y.clone()
-        y_clean[y == 2] = 0  # Temporarily set ignore to 0
+        y_clean[~valid_mask] = 0
 
         loss = criterion(logits, y_clean, weight_mask)
         total_loss += loss.item()
 
         probs = torch.sigmoid(logits)
 
-        mask = y != 2
-
-        if mask.sum() > 0:
-            all_preds.append(probs[mask].cpu().numpy())
-            all_targets.append(y[mask].cpu().numpy())
+        if valid_mask.sum() > 0:
+            all_preds.append(probs[valid_mask].cpu().numpy())
+            all_targets.append(y[valid_mask].cpu().numpy())
 
     avg_loss = total_loss / len(loader)
 
     if not all_targets:
         logger.warning("No valid pixels found in validation set.")
-        return avg_loss, 0.0, 0.0, None, None
+        if return_preds: return avg_loss, 0.0, 0.0, None, None
+        return avg_loss, 0.0, 0.0
 
     y_true = np.concatenate(all_targets)
     y_scores = np.concatenate(all_preds)
-    precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-    pr_auc = auc(recall, precision)
-
-    # --- Calculate Max F0.5 Score for Validation ---
-    with np.errstate(divide='ignore', invalid='ignore'):
-        beta = 0.5
-        numerator = (1 + beta**2) * precision * recall
-        denominator = (beta**2 * precision) + recall
-        fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
     
-    val_f05 = np.max(fbeta)
+    if len(np.unique(y_true)) < 2:
+         pr_auc = 0.5
+         val_f05 = 0.0
+    else:
+        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+        pr_auc = auc(recall, precision)
+
+        # --- Calculate Max F0.5 Score for Validation ---
+        with np.errstate(divide='ignore', invalid='ignore'):
+            beta = 0.5
+            numerator = (1 + beta**2) * precision * recall
+            denominator = (beta**2 * precision) + recall
+            fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
+        
+        val_f05 = np.max(fbeta)
 
     if return_preds:
         return avg_loss, pr_auc, val_f05, y_scores, y_true
@@ -206,14 +243,15 @@ def main():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--context_months", type=int, default=12, help="Input window length")
-    parser.add_argument("--model_type", type=str, default="3dcnn", choices=["3dcnn", "resunet", "convlstm", "vivit", "convlstm3d", "resunet3d"])
+    parser.add_argument("--model_type", type=str, default="resunet", choices=["resunet", "vivit", "convlstm3d", "resunet3d"])
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
     parser.add_argument("--wandb_project", type=str, default="deforestation-prediction")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument('--mode', type=str, default='sequence', choices=['sequence', 'snapshot'],
-                    help="Training mode: 'sequence' for 3D models (time history), 'snapshot' for 2D models (single random frame).")
+    parser.add_argument('--mode', type=str, default='snapshot', choices=['sequence', 'snapshot'],
+                        help="Training mode: 'sequence' for 3D models, 'snapshot' for 2D models.")
     parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of warmup epochs")
 
     args = parser.parse_args()
@@ -234,43 +272,41 @@ def main():
         train_ds = DeforestationDataset(args.data_root, "train", context_length=args.context_months, mode=args.mode)
         val_ds = DeforestationDataset(args.data_root, "val", context_length=args.context_months, mode=args.mode)
 
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
         # 2. Initialize Model
         sample_X, _ = train_ds[0]
         in_channels = sample_X.shape[0]
-        time_depth = sample_X.shape[1]
-
+        
+        # Determine time depth based on mode
         if args.mode == 'snapshot':
-            time_depth = 1  # For snapshot mode, time depth is 1
+            time_depth = 1 
         else: # 'sequence' mode
             time_depth = args.context_months if args.context_months else 12
 
-        logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[2]}, W={sample_X.shape[3]}")
+        logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[-2]}, W={sample_X.shape[-1]}")
 
-        if args.model_type == "3dcnn":
-            model = Simple3DCNN(in_channels=in_channels, time_depth=time_depth).to(device)
-        elif args.model_type == "resunet":
+        # Model Factory
+        if args.model_type == "resunet":
+            # 2D Model
             model = ResUNet(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
-        elif args.model_type == "convlstm":
-            model = ConvLSTM(in_channels=in_channels, time_depth=time_depth).to(device)
         elif args.model_type == "vivit":
-            model = ViViTSegmentation(in_channels=in_channels, time_depth=args.context_months).to(device)
+            model = ViViTSegmentation(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
         elif args.model_type == "convlstm3d":
-            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth).to(device)
+            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
         elif args.model_type == "resunet3d":
-            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth).to(device)
+            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
         else:
             raise ValueError(f"Model type '{args.model_type}' not implemented.")
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = torch.optim.RAdam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
         # Select Loss Function
         # criterion = WeightedFocalLoss(alpha=0.25, gamma=2.0).to(device)
         criterion = CombinedLoss().to(device)
 
-        best_f05 = 0.0  # Changed from best_auc
+        best_f05 = 0.0 
         filename = f"{args.wandb_run_name or args.model_type}_best.pth"
         best_model_path = save_dir / filename
 
@@ -286,10 +322,10 @@ def main():
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "train_pr_auc": train_auc,
-                "train_f05": train_f05, # Logged
+                "train_f05": train_f05, 
                 "val_loss": val_loss,
                 "val_pr_auc": val_auc,
-                "val_f05": val_f05      # Logged
+                "val_f05": val_f05      
             }, step=epoch + 1)
 
             log_validation_visuals(model, val_loader, device, epoch + 1)
@@ -306,12 +342,15 @@ def main():
         logger.info("Training Complete. Starting Test Evaluation...")
         
         # 1. Load Best Model
-        model.load_state_dict(torch.load(best_model_path))
+        if best_model_path.exists():
+            model.load_state_dict(torch.load(best_model_path))
+        else:
+            logger.warning("No best model found, using last epoch model.")
         
         # 2. Load Test Data
         try:
             test_ds = DeforestationDataset(args.data_root, "test", context_length=args.context_months, mode=args.mode)
-            test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+            test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
         except Exception:
             logger.error("Test set not found or empty. Skipping test evaluation.")
             return
@@ -320,12 +359,16 @@ def main():
         # We re-run validation on the best model to get predictions
         _, _, _, val_probs, val_targets = validate(model, val_loader, criterion, device, return_preds=True)
         
-        prec, rec, thresholds = precision_recall_curve(val_targets, val_probs)
-        beta = 0.5
-        fbeta = (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec + 1e-8)
-        best_idx = np.argmax(fbeta)
-        best_threshold = thresholds[best_idx]
-        val_f05 = fbeta[best_idx]
+        if len(np.unique(val_targets)) > 1:
+            prec, rec, thresholds = precision_recall_curve(val_targets, val_probs)
+            beta = 0.5
+            fbeta = (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec + 1e-8)
+            best_idx = np.argmax(fbeta)
+            best_threshold = thresholds[best_idx]
+            val_f05 = fbeta[best_idx]
+        else:
+            best_threshold = 0.5
+            val_f05 = 0.0
         
         logger.info(f"Optimal Threshold found on Val: {best_threshold:.4f} (Val F0.5: {val_f05:.4f})")
 
@@ -335,9 +378,9 @@ def main():
         # Apply threshold
         test_preds = (test_probs >= best_threshold).astype(int)
         
-        test_precision = precision_score(test_targets, test_preds)
-        test_recall = recall_score(test_targets, test_preds)
-        test_f05 = fbeta_score(test_targets, test_preds, beta=0.5)
+        test_precision = precision_score(test_targets, test_preds, zero_division=0)
+        test_recall = recall_score(test_targets, test_preds, zero_division=0)
+        test_f05 = fbeta_score(test_targets, test_preds, beta=0.5, zero_division=0)
 
         logger.info("="*30)
         logger.info(f"FINAL TEST RESULTS (at threshold {best_threshold:.4f})")
