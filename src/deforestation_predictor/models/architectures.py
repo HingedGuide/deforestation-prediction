@@ -161,17 +161,26 @@ class ResidualBlock3D(nn.Module):
         return out
 
 
+# TODO: Check Convolution kernel sizes so that it EXACTLY matches Laura
+# TODO: Check dropout. Laura uses dropout in her ResUNet.
+# TODO: Check what the input size is of the data that Luara uses. Specifically Time dimension...
+
 class ResUNet(nn.Module):
     def __init__(self, in_channels, time_depth, num_classes=2, filters=[32, 64, 128, 256]):
+        """
+        ResUNet aligned with Laura's main_multi_tiles.py default configuration.
+        """
         super(ResUNet, self).__init__()
 
         # Total input channels = variables * time_steps (Early Fusion)
         input_dim = in_channels * time_depth
         
+        # We use the lighter filters found in main_multi_tiles.py default
         if len(filters) < 4:
             filters = [32, 64, 128, 256]
 
         # --- Encoder ---
+        # Laura uses 3x3 kernels everywhere (proven in src/models.py)
         self.input_layer = nn.Sequential(
             nn.Conv2d(input_dim, filters[0], kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(filters[0]),
@@ -182,21 +191,20 @@ class ResUNet(nn.Module):
             nn.Conv2d(input_dim, filters[0], kernel_size=3, stride=1, padding=1)
         )
         
-        self.residual_conv_1 = ResidualConv(filters[0], 7, filters[1], 2, 1)
-        self.residual_conv_2 = ResidualConv(filters[1], 7, filters[2], 2, 0)
+        # Kernel size 3, Padding 1 (Fixed from 7)
+        self.residual_conv_1 = ResidualConv(filters[0], 3, filters[1], 2, 1)
+        self.residual_conv_2 = ResidualConv(filters[1], 3, filters[2], 2, 1)
 
         # --- Bridge ---
-        self.bridge = ResidualConv(filters[2], 3, filters[3], 2, 0)
+        self.bridge = ResidualConv(filters[2], 3, filters[3], 2, 1)
 
-        # --- Decoder (Aangepast voor Concatenation) ---
-        # Block 1: Input is cat(Bridge_out, Skip3). Bridge=filters[3], Skip3=filters[2]
-        self.up_residual_conv1 = ResidualConv(filters[3] + filters[2], 3, filters[2], 1, 0)
+        # --- Decoder (Concatenation Style) ---
+        self.up_residual_conv1 = ResidualConv(filters[3] + filters[2], 3, filters[2], 1, 1)
+        self.up_residual_conv2 = ResidualConv(filters[2] + filters[1], 3, filters[1], 1, 1)
+        self.up_residual_conv3 = ResidualConv(filters[1] + filters[0], 3, filters[0], 1, 1)
 
-        # Block 2: Input is cat(Up1_out, Skip2). Up1=filters[2], Skip2=filters[1]
-        self.up_residual_conv2 = ResidualConv(filters[2] + filters[1], 3, filters[1], 1, 0)
-
-        # Block 3: Input is cat(Up2_out, Skip1). Up2=filters[1], Skip1=filters[0]
-        self.up_residual_conv3 = ResidualConv(filters[1] + filters[0], 3, filters[0], 1, 0)
+        # Dropout is present in Laura's src/models.py
+        self.drop = nn.Dropout2d(p=0.3)
 
         self.output_layer = nn.Sequential(
             nn.Conv2d(filters[0], num_classes, 1, 1),
@@ -215,21 +223,21 @@ class ResUNet(nn.Module):
         # --- Bridge ---
         x4 = self.bridge(x3) 
         
-        # --- Decode (Concatenation Style) ---
-        # Block 1
+        # --- Decode ---
         x4 = F.interpolate(x4, size=x3.size()[2:], mode='bilinear', align_corners=True)
-        x5 = torch.cat([x4, x3], dim=1)  # <-- CONCAT
+        x5 = torch.cat([x4, x3], dim=1)
         x6 = self.up_residual_conv1(x5)
 
-        # Block 2
         x6 = F.interpolate(x6, size=x2.size()[2:], mode='bilinear', align_corners=True)
-        x7 = torch.cat([x6, x2], dim=1)  # <-- CONCAT
+        x7 = torch.cat([x6, x2], dim=1)
         x8 = self.up_residual_conv2(x7)
 
-        # Block 3
         x8 = F.interpolate(x8, size=x1.size()[2:], mode='bilinear', align_corners=True)
-        x9 = torch.cat([x8, x1], dim=1)  # <-- CONCAT
+        x9 = torch.cat([x8, x1], dim=1)
         x10 = self.up_residual_conv3(x9)
+        
+        # Apply Dropout
+        x10 = self.drop(x10)
         
         output = self.output_layer(x10)
         
