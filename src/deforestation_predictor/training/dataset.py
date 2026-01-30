@@ -92,56 +92,71 @@ class DeforestationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         
+        # Instellingen voor kwaliteitscontrole
+        min_defo_pixels = 100  # <--- HIER KUN JE MEE SPELEN (Wil je minimaal 10, 20, 50 pixels?)
+        max_attempts = 20     # Hoe vaak proberen we een 'rijke' crop te vinden?
+
         # 1. Select Time Step t
         use_positive = (self.split == 'train') and (np.random.rand() < self.balance_prob)
         
+        t, y, x = 0, 0, 0
+        found_good_crop = False
+
         if use_positive and len(self.split_positives) > 0:
-            # Pick from positives
-            rnd_idx = np.random.randint(len(self.split_positives))
-            t, center_y, center_x = self.split_positives[rnd_idx]
+            # --- START RETRY LOOP ---
+            attempts = 0
+            while attempts < max_attempts:
+                # Pick from positives
+                rnd_idx = np.random.randint(len(self.split_positives))
+                t, center_y, center_x = self.split_positives[rnd_idx]
+                
+                # Center the crop
+                y = center_y - self.crop_size // 2
+                x = center_x - self.crop_size // 2
+                
+                # Jitter (Variatie toevoegen)
+                y += np.random.randint(-5, 6)
+                x += np.random.randint(-5, 6)
+
+                # Boundary Checks
+                y = max(0, min(y, self.H - self.crop_size))
+                x = max(0, min(x, self.W - self.crop_size))
+
+                # CHECK: Is deze crop goed genoeg?
+                # We checken alleen even snel de label-map (dat is snel via mmap)
+                # Let op: t-1 omdat labels op t-1 zitten in jouw logica
+                y_check = self.y_mmap[t-1, y:y+self.crop_size, x:x+self.crop_size]
+                
+                if (y_check == 1).sum() >= min_defo_pixels:
+                    found_good_crop = True
+                    break # Gevonden! Uit de loop.
+                
+                attempts += 1
+            # --- EIND RETRY LOOP ---
             
-            # Center the crop
-            y = center_y - self.crop_size // 2
-            x = center_x - self.crop_size // 2
-            
-            # Jitter
-            y += np.random.randint(-5, 6)
-            x += np.random.randint(-5, 6)
+            # Als we na 20 pogingen nog niks hebben, gebruiken we gewoon de laatste (safety fallback)
             
         else:
-            # Random sampling
+            # Random sampling (voornamelijk bos)
             t = np.random.choice(self.valid_time_indices)
             y = np.random.randint(0, self.H - self.crop_size)
             x = np.random.randint(0, self.W - self.crop_size)
+            
+            # Boundary checks voor random sample
+            y = max(0, min(y, self.H - self.crop_size))
+            x = max(0, min(x, self.W - self.crop_size))
 
-        # 2. Boundary Checks
-        y = max(0, min(y, self.H - self.crop_size))
-        x = max(0, min(x, self.W - self.crop_size))
-
-        # 3. Slicing
-        # 'sequence' mode: return volume [C, Context, H, W]
-        # 'snapshot' mode: return single frame [C, 1, H, W]
-        
+        # 3. Slicing (Nu halen we de data pas echt op)
         t_start = t - self.context_length
         t_end = t
         
-        # Get Full Sequence first
+        # Get Full Sequence
         X_crop = self.X_mmap[:, t_start:t_end, y:y+self.crop_size, x:x+self.crop_size]
         
         if self.mode == 'snapshot':
-            # Take only the last frame (or random frame in sequence? usually last for prediction)
-            # User requirement: "snapshot - Returns a single time step"
             # We keep dimensions [C, 1, H, W]
             X_crop = X_crop[:, -1:, :, :]
 
-        # y is the label at the target time t (which corresponds to index t-1 in labels if alignment is 1:1)
-        # Assuming y_mmap[t] corresponds to the label for the state at X[t]
-        # In build_3d_dataset, we aligned dates. 
-        # If t is the index in dates, y_mmap[t] is the label.
-        # X_crop ends at t (exclusive in slice, so includes indices up to t-1). 
-        # Wait, if X is 0..T-1. Slicing t_start:t gives indices t_start..t-1. 
-        # The label for the last frame (t-1) is y_mmap[t-1].
-        
         y_crop = self.y_mmap[t-1, y:y+self.crop_size, x:x+self.crop_size]
 
         # 4. Convert to Tensor

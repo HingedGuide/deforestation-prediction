@@ -111,21 +111,20 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
         X, y = X.to(device), y.to(device)
 
         # --- FIX: STRICT MASKING ---
-        # Instead of (y != 2), we allow ONLY 0 and 1.
-        # This filters out 2 (Ignore) AND 255 (No Data).
         valid_mask = (y == 0) | (y == 1)
         
-        # Create weight mask for the Loss function
-        # Invalid pixels get weight 0.0
-        weight_mask = valid_mask.float().to(device)
+        # --- IMPLEMENTATIE WEIGHTING (HET BREEKIJZER) ---
+        # Maak een mask met gewichten: Bos=1.0, Kap=10.0
+        weight_mask = torch.zeros_like(y, dtype=torch.float, device=device)
+        weight_mask[y == 0] = 1.0
+        weight_mask[y == 1] = 10.0  # Forceer focus op ontbossing!
+        weight_mask[~valid_mask] = 0.0
 
         optimizer.zero_grad()
         logits = model(X)
         logits = logits.squeeze(1)
 
         # --- FIX: CLEAN TARGETS FOR LOSS ---
-        # Set invalid pixels to 0 so the math doesn't explode (log(NaN)).
-        # The weight_mask will ensure these 0s don't affect the gradient.
         y_clean = y.clone()
         y_clean[~valid_mask] = 0 
 
@@ -138,7 +137,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
         total_loss += loss.item()
 
         # --- FIX: METRICS ---
-        # Only collect valid pixels for Scikit-Learn (avoids multiclass error)
         with torch.no_grad():
             probs = torch.sigmoid(logits)
             if valid_mask.sum() > 0:
@@ -151,17 +149,18 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
 
     avg_loss = total_loss / len(loader)
 
-    if not all_targets:
-        train_auc = 0.0
-        train_f05 = 0.0
-    else:
+    # Metrics calculation
+    train_auc = 0.0
+    train_f05 = 0.0
+    train_precision = 0.0
+    train_recall = 0.0
+
+    if all_targets:
         y_true = np.concatenate(all_targets)
         y_scores = np.concatenate(all_preds)
         
-        # Safety check for single class in batch
         if len(np.unique(y_true)) < 2:
             train_auc = 0.5
-            train_f05 = 0.0
         else:
             precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
             train_auc = auc(recall, precision)
@@ -172,9 +171,16 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
                 numerator = (1 + beta**2) * precision * recall
                 denominator = (beta**2 * precision) + recall
                 fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-            train_f05 = np.max(fbeta)
+            
+            # Find the index of the best F0.5 score
+            best_idx = np.argmax(fbeta)
+            train_f05 = fbeta[best_idx]
+            
+            # Get Precision and Recall at that specific threshold
+            train_precision = precision[best_idx]
+            train_recall = recall[best_idx]
 
-    return avg_loss, train_auc, train_f05
+    return avg_loss, train_auc, train_f05, train_precision, train_recall
 
 
 @torch.no_grad()
@@ -187,9 +193,14 @@ def validate(model, loader, criterion, device, return_preds=False):
     for X, y in tqdm(loader, desc="Validation", leave=False):
         X, y = X.to(device), y.to(device)
         
-        # --- FIX: STRICT MASKING ---
+        # --- FIX: STRICT MASKING & WEIGHTING ---
         valid_mask = (y == 0) | (y == 1)
-        weight_mask = valid_mask.float().to(device)
+        
+        # Consistent weighting in validation (for fair loss comparison)
+        weight_mask = torch.zeros_like(y, dtype=torch.float, device=device)
+        weight_mask[y == 0] = 1.0
+        weight_mask[y == 1] = 10.0
+        weight_mask[~valid_mask] = 0.0
         
         logits = model(X)
         logits = logits.squeeze(1)
@@ -210,18 +221,20 @@ def validate(model, loader, criterion, device, return_preds=False):
 
     if not all_targets:
         logger.warning("No valid pixels found in validation set.")
-        if return_preds: return avg_loss, 0.0, 0.0, None, None
-        return avg_loss, 0.0, 0.0
+        if return_preds: return avg_loss, 0.0, 0.0, 0.0, 0.0, None, None
+        return avg_loss, 0.0, 0.0, 0.0, 0.0
 
     y_true = np.concatenate(all_targets)
     y_scores = np.concatenate(all_preds)
     
-    if len(np.unique(y_true)) < 2:
-         pr_auc = 0.5
-         val_f05 = 0.0
-    else:
+    val_auc = 0.5
+    val_f05 = 0.0
+    val_precision = 0.0
+    val_recall = 0.0
+
+    if len(np.unique(y_true)) >= 2:
         precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-        pr_auc = auc(recall, precision)
+        val_auc = auc(recall, precision)
 
         # --- Calculate Max F0.5 Score for Validation ---
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -230,12 +243,17 @@ def validate(model, loader, criterion, device, return_preds=False):
             denominator = (beta**2 * precision) + recall
             fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
         
-        val_f05 = np.max(fbeta)
+        best_idx = np.argmax(fbeta)
+        val_f05 = fbeta[best_idx]
+        
+        # Get Precision/Recall at the optimal threshold
+        val_precision = precision[best_idx]
+        val_recall = recall[best_idx]
 
     if return_preds:
-        return avg_loss, pr_auc, val_f05, y_scores, y_true
+        return avg_loss, val_auc, val_f05, val_precision, val_recall, y_scores, y_true
     
-    return avg_loss, pr_auc, val_f05
+    return avg_loss, val_auc, val_f05, val_precision, val_recall
 
 def main():
     parser = argparse.ArgumentParser(description="Deep Learning Training Loop")
@@ -327,22 +345,30 @@ def main():
             logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
             
             # Unpack new return values
-            train_loss, train_auc, train_f05 = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, args)
-            val_loss, val_auc, val_f05 = validate(model, val_loader, criterion, device)
+            train_loss, train_auc, train_f05, train_prec, train_rec = train_one_epoch(
+                model, train_loader, optimizer, criterion, device, epoch, args
+            )
+            val_loss, val_auc, val_f05, val_prec, val_rec = validate(
+                model, val_loader, criterion, device
+            )
 
             wandb.log({
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "train_pr_auc": train_auc,
                 "train_f05": train_f05, 
+                "train_precision": train_prec,
+                "train_recall": train_rec,
                 "val_loss": val_loss,
                 "val_pr_auc": val_auc,
-                "val_f05": val_f05      
+                "val_f05": val_f05,
+                "val_precision": val_prec,
+                "val_recall": val_rec
             }, step=epoch + 1)
 
             log_validation_visuals(model, val_loader, device, epoch + 1)
 
-            logger.info(f"Epoch {epoch + 1}: Val AUC={val_auc:.4f} | Val F0.5={val_f05:.4f}")
+            logger.info(f"Epoch {epoch + 1}: Val F0.5={val_f05:.4f} | Prec={val_prec:.4f} | Rec={val_rec:.4f}")
 
             # Save based on F0.5 score
             if val_f05 > best_f05:
@@ -369,7 +395,7 @@ def main():
 
         # 3. Find Optimal Threshold on Validation Set
         # We re-run validation on the best model to get predictions
-        _, _, _, val_probs, val_targets = validate(model, val_loader, criterion, device, return_preds=True)
+        _, _, _, _, _, val_probs, val_targets = validate(model, val_loader, criterion, device, return_preds=True)
         
         if len(np.unique(val_targets)) > 1:
             prec, rec, thresholds = precision_recall_curve(val_targets, val_probs)
@@ -385,7 +411,7 @@ def main():
         logger.info(f"Optimal Threshold found on Val: {best_threshold:.4f} (Val F0.5: {val_f05:.4f})")
 
         # 4. Evaluate on Test Set
-        test_loss, test_auc, _, test_probs, test_targets = validate(model, test_loader, criterion, device, return_preds=True)
+        test_loss, test_auc, _, _, _, test_probs, test_targets = validate(model, test_loader, criterion, device, return_preds=True)
         
         # Apply threshold
         test_preds = (test_probs >= best_threshold).astype(int)
