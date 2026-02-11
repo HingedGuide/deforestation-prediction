@@ -10,3 +10,7 @@ __pycache__/
 /checkpoints_6m_horizon/
 /data_6m/
 /slurm_requests/
+/laura_preprocessing/
+/checks/
+test_results.log
+training_experiment.log
