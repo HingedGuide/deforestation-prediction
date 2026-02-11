@@ -1,454 +1,344 @@
 import argparse
-import math
-import torch
+import os
+import random
 import numpy as np
+import torch
+import torch.nn as nn
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
-from sklearn.metrics import precision_recall_curve, auc, precision_score, recall_score, fbeta_score
+from sklearn.metrics import precision_recall_curve
 
-# Ensure these match your actual file structure
-from deforestation_predictor.training.dataset import DeforestationDataset
-from deforestation_predictor.models.architectures import ResUNet, ResUNet3D, ViViTSegmentation, ConvLSTM3D
-from deforestation_predictor.training.loss import WeightedFocalLoss, CombinedLoss
+# --- Imports ---
+from deforestation_predictor.models.architectures import ResUNet, ResUNet3D
+from deforestation_predictor.training.loss import CombinedLoss 
 from deforestation_predictor.utils.logger import setup_logger
 
-# Initialize logger for this module
+if 'setup_logger' not in locals():
+    import logging
+    def setup_logger(name, log_file):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+        handler = logging.FileHandler(log_file)
+        logger.addHandler(handler)
+        logger.addHandler(logging.StreamHandler())
+        return logger
+
 logger = setup_logger(__name__, log_file="training_experiment.log")
 
+# ==============================================================================
+# 1. Dataset Class
+# ==============================================================================
+class MultiTileDataset(Dataset):
+    def __init__(self, img_paths, gt_paths, coordinates, size_crops=64, sequence_length=1, epoch_size=None):
+        self.img_paths = img_paths
+        self.gt_paths = gt_paths
+        self.coords = coordinates
+        self.size_crops = size_crops
+        self.seq_len = sequence_length
+        self.images = [np.load(p, mmap_mode='r') for p in img_paths]
+        self.gts = [np.load(p, mmap_mode='r') for p in gt_paths]
+        self.epoch_size = epoch_size if epoch_size else len(self.coords)
 
-def log_validation_visuals(model, loader, device, epoch, num_samples=4):
+    def __len__(self):
+        return min(len(self.coords), self.epoch_size)
+
+    def __getitem__(self, idx):
+        tile_idx, t, x, y = self.coords[idx]
+        x_end, y_end = x + self.size_crops, y + self.size_crops
+        
+        img_data = self.images[tile_idx][:, t : t + self.seq_len, x : x_end, y : y_end]
+        X = torch.from_numpy(np.copy(img_data)).float()
+        
+        if self.seq_len == 1:
+            X = X.squeeze(1) 
+
+        target_t = t + self.seq_len - 1
+        gt_data = self.gts[tile_idx][target_t, x : x_end, y : y_end]
+        y = torch.from_numpy(np.copy(gt_data)).long()
+
+        return X, y
+
+# ==============================================================================
+# 2. Coordinate Generator (Geoptimaliseerd voor Memory)
+# ==============================================================================
+def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance=1, max_samples=None):
     """
-    Logs input, ground truth, and prediction images to W&B.
+    Genereert coordinaten.
+    Args:
+        max_samples (int): Maximaal aantal samples om te verzamelen (voorkomt OOM bij testen).
     """
-    model.eval()
-    images_to_log = []
+    all_coordinates = [] 
+    logger.info(f"Scanning {len(gt_paths)} tiles (Seq Len: {sequence_length})...")
 
-    try:
-        X, y = next(iter(loader))
-    except StopIteration:
-        return
+    # Als we een limiet hebben, verdelen we die over de tiles/tijdstappen (ruwe schatting)
+    # Dit is een veiligheidsmechanisme om memory spikes te voorkomen
+    if max_samples:
+        logger.info(f"Subsampling enabled: Max {max_samples} total samples.")
 
-    X, y = X.to(device), y.to(device)
-
-    with torch.no_grad():
-        logits = model(X)
-        # Handle 1D channel output
-        if logits.shape[1] == 1:
-            probs = torch.sigmoid(logits).squeeze(1)
-        else:
-            probs = torch.sigmoid(logits[:, 0]) 
-
-    for i in range(min(num_samples, len(X))):
-        # VISUALIZATION FIX: Handle 4D or 5D input
-        # If [B, C, T, H, W], take last time step. If [B, C, H, W], take whole image.
-        if X.ndim == 5:
-            img_t = X[i, 0, -1, :, :].cpu().numpy()
-        else:
-            img_t = X[i, 0, :, :].cpu().numpy()
-
-        # Normalize for display
-        img_min, img_max = img_t.min(), img_t.max()
-        if img_max > img_min:
-            img_t = (img_t - img_min) / (img_max - img_min)
-        else:
-            img_t = np.zeros_like(img_t)
-
-        gt_t = y[i].cpu().numpy()
-        pred_t = probs[i].cpu().numpy()
+    for tile_idx, (gt_path, mask_path) in enumerate(zip(gt_paths, mask_paths)):
+        gt_array = np.load(gt_path, mmap_mode='r') 
+        mask = np.load(mask_path, mmap_mode='r')
+        mask_data = np.array(mask)
         
-        # FIX: Clean GT for visualization (map 255/garbage to 2 for 'Ignore')
-        gt_viz = gt_t.copy()
-        gt_viz[(gt_viz != 0) & (gt_viz != 1)] = 2
+        # Randen negeren
+        mask_data[:size_crops, :] = 0; mask_data[-size_crops:, :] = 0
+        mask_data[:, :size_crops] = 0; mask_data[:, -size_crops:] = 0
 
-        images_to_log.append(wandb.Image(
-            img_t,
-            masks={
-                "predictions": {
-                    "mask_data": (pred_t > 0.5).astype(int),
-                    "class_labels": {0: "Forest", 1: "Deforestation"}
-                },
-                "ground_truth": {
-                    "mask_data": gt_viz.astype(int),
-                    "class_labels": {0: "Forest", 1: "Deforestation", 2: "Ignore"}
-                }
-            },
-            caption=f"Epoch {epoch} - Sample {i}"
-        ))
+        max_time = gt_array.shape[0] - sequence_length + 1
+        if max_time <= 0: continue
 
-    wandb.log({"Visual Results": images_to_log}, step=epoch)
-
-
-def train_one_epoch(model, loader, optimizer, criterion, device, epoch, args):
-    model.train()
-    total_loss = 0.0
-
-    total_steps = len(loader) * args.epochs
-    warmup_steps = len(loader) * args.warmup_epochs
-
-    # --- Custom Scheduler Logic (Kept as is) ---
-    warmup_schedule = np.linspace(0, args.lr, warmup_steps)
-    iters = np.arange(total_steps - warmup_steps)
-    cosine_schedule = np.array([
-        0 + 0.5 * (args.lr - 0) * (1 + math.cos(math.pi * t / (total_steps - warmup_steps)))
-        for t in iters
-    ])
-    lr_schedule = np.concatenate((warmup_schedule, cosine_schedule))
-
-    all_preds = []
-    all_targets = []
-
-    pbar = tqdm(loader, desc="Training", leave=False)
-
-    for step, (X, y) in enumerate(pbar):
-        global_step = epoch * len(loader) + step
-        if global_step < len(lr_schedule):
-            current_lr = lr_schedule[global_step]
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
-
-        X, y = X.to(device), y.to(device)
-
-        # --- FIX: STRICT MASKING ---
-        valid_mask = (y == 0) | (y == 1)
-        
-        # --- IMPLEMENTATIE WEIGHTING (HET BREEKIJZER) ---
-        # Maak een mask met gewichten: Bos=1.0, Kap=10.0
-        weight_mask = torch.zeros_like(y, dtype=torch.float, device=device)
-        weight_mask[y == 0] = 1.0
-        weight_mask[y == 1] = 10.0  # Forceer focus op ontbossing!
-        weight_mask[~valid_mask] = 0.0
-
-        optimizer.zero_grad()
-        logits = model(X)
-        logits = logits.squeeze(1)
-
-        # --- FIX: CLEAN TARGETS FOR LOSS ---
-        y_clean = y.clone()
-        y_clean[~valid_mask] = 0 
-
-        # Forward loss with weight mask
-        loss = criterion(logits, y_clean, weight_mask)
-        
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-        # --- FIX: METRICS ---
-        with torch.no_grad():
-            probs = torch.sigmoid(logits)
-            if valid_mask.sum() > 0:
-                all_preds.append(probs[valid_mask].cpu().numpy())
-                all_targets.append(y[valid_mask].cpu().numpy())
-
-        if step % 10 == 0:
-            wandb.log({"train_batch_loss": loss.item()})
-        pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-    avg_loss = total_loss / len(loader)
-
-    # Metrics calculation
-    train_auc = 0.0
-    train_f05 = 0.0
-    train_precision = 0.0
-    train_recall = 0.0
-
-    if all_targets:
-        y_true = np.concatenate(all_targets)
-        y_scores = np.concatenate(all_preds)
-        
-        if len(np.unique(y_true)) < 2:
-            train_auc = 0.5
-        else:
-            precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-            train_auc = auc(recall, precision)
+        for t in range(max_time):
+            target_t = t + sequence_length - 1
+            gt_slice = gt_array[target_t]
             
-            # --- Calculate Max F0.5 Score for Training ---
-            with np.errstate(divide='ignore', invalid='ignore'):
-                beta = 0.5
-                numerator = (1 + beta**2) * precision * recall
-                denominator = (beta**2 * precision) + recall
-                fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
-            
-            # Find the index of the best F0.5 score
-            best_idx = np.argmax(fbeta)
-            train_f05 = fbeta[best_idx]
-            
-            # Get Precision and Recall at that specific threshold
-            train_precision = precision[best_idx]
-            train_recall = recall[best_idx]
+            # --- Training Logic (Balanced) ---
+            if balance == 1:
+                zeros = np.where((gt_slice == 0) & (mask_data == 1))
+                ones = np.where((gt_slice == 1) & (mask_data == 1))
+                
+                zeros_coords = list(zip(zeros[0], zeros[1]))
+                ones_coords = list(zip(ones[0], ones[1]))
+                
+                if len(zeros_coords) > 0 and len(ones_coords) > 0:
+                    n_samples = min(len(zeros_coords), len(ones_coords))
+                    # Optioneel: Cap op max 500 per frame tijdens training
+                    # n_samples = min(n_samples, 500)
+                    
+                    zeros_coords = random.sample(zeros_coords, n_samples)
+                    ones_coords = random.sample(ones_coords, n_samples)
+                    
+                    for r, c in zeros_coords: all_coordinates.append((tile_idx, t, r, c))
+                    for r, c in ones_coords: all_coordinates.append((tile_idx, t, r, c))
 
-    return avg_loss, train_auc, train_f05, train_precision, train_recall
+            # --- Testing Logic (Unbalanced / Representative) ---
+            elif balance == 0:
+                # Hier zat het probleem: np.where op hele map geeft miljoenen hits.
+                # We moeten subsamplen in NumPy voordat we er een Python list van maken.
+                
+                # Vind indices van ALLE valide pixels (Bos + Ontbossing)
+                # valid_mask is een boolean array van de hele image
+                valid_mask = ((gt_slice == 0) | (gt_slice == 1)) & (mask_data == 1)
+                
+                # Haal de coordinaten op (row indices, col indices)
+                rows, cols = np.where(valid_mask)
+                total_valid = len(rows)
+                
+                if total_valid > 0:
+                    # Als max_samples is ingesteld, bereken hoeveel we van DEZE frame mogen pakken.
+                    # Simpele heuristiek: max_samples gedeeld door (aantal tiles * aantal timesteps)
+                    # Of gewoon een fixed cap per frame om OOM te voorkomen.
+                    if max_samples:
+                        # We willen random samples trekken ZONDER eerst de python list te maken
+                        # Laten we zeggen max 1000 per frame tijdens testing om totaal redelijk te houden
+                        # Of we gebruiken de globale max_samples.
+                        
+                        # Veilige gok: cap op bijv 2000 per tijdstap als we testen.
+                        # Dit geeft met 28 tijdstappen * 4 tiles al ~224.000 samples.
+                        samples_to_take = min(total_valid, 2000) 
+                        
+                        # Random indices kiezen in NumPy (Super snel & geheugen efficient)
+                        indices = np.random.choice(total_valid, samples_to_take, replace=False)
+                        rows = rows[indices]
+                        cols = cols[indices]
+                    
+                    # Nu pas toevoegen aan de lijst (nu is het klein)
+                    for r, c in zip(rows, cols):
+                        all_coordinates.append((tile_idx, t, r, c))
 
-
-@torch.no_grad()
-def validate(model, loader, criterion, device, return_preds=False):
-    model.eval()
-    total_loss = 0.0
-    all_preds = []
-    all_targets = []
-
-    for X, y in tqdm(loader, desc="Validation", leave=False):
-        X, y = X.to(device), y.to(device)
-        
-        # --- FIX: STRICT MASKING & WEIGHTING ---
-        valid_mask = (y == 0) | (y == 1)
-        
-        # Consistent weighting in validation (for fair loss comparison)
-        weight_mask = torch.zeros_like(y, dtype=torch.float, device=device)
-        weight_mask[y == 0] = 1.0
-        weight_mask[y == 1] = 10.0
-        weight_mask[~valid_mask] = 0.0
-        
-        logits = model(X)
-        logits = logits.squeeze(1)
-
-        y_clean = y.clone()
-        y_clean[~valid_mask] = 0
-
-        loss = criterion(logits, y_clean, weight_mask)
-        total_loss += loss.item()
-
-        probs = torch.sigmoid(logits)
-
-        if valid_mask.sum() > 0:
-            all_preds.append(probs[valid_mask].cpu().numpy())
-            all_targets.append(y[valid_mask].cpu().numpy())
-
-    avg_loss = total_loss / len(loader)
-
-    if not all_targets:
-        logger.warning("No valid pixels found in validation set.")
-        if return_preds: return avg_loss, 0.0, 0.0, 0.0, 0.0, None, None
-        return avg_loss, 0.0, 0.0, 0.0, 0.0
-
-    y_true = np.concatenate(all_targets)
-    y_scores = np.concatenate(all_preds)
+    random.shuffle(all_coordinates)
     
-    val_auc = 0.5
-    val_f05 = 0.0
-    val_precision = 0.0
-    val_recall = 0.0
-
-    if len(np.unique(y_true)) >= 2:
-        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
-        val_auc = auc(recall, precision)
-
-        # --- Calculate Max F0.5 Score for Validation ---
-        with np.errstate(divide='ignore', invalid='ignore'):
-            beta = 0.5
-            numerator = (1 + beta**2) * precision * recall
-            denominator = (beta**2 * precision) + recall
-            fbeta = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator!=0)
+    # Harde cap aan het einde voor de zekerheid
+    if max_samples and len(all_coordinates) > max_samples:
+        all_coordinates = all_coordinates[:max_samples]
         
-        best_idx = np.argmax(fbeta)
-        val_f05 = fbeta[best_idx]
-        
-        # Get Precision/Recall at the optimal threshold
-        val_precision = precision[best_idx]
-        val_recall = recall[best_idx]
+    logger.info(f"Total samples collected: {len(all_coordinates)}")
+    return all_coordinates
 
-    if return_preds:
-        return avg_loss, val_auc, val_f05, val_precision, val_recall, y_scores, y_true
-    
-    return avg_loss, val_auc, val_f05, val_precision, val_recall
+def fix_random_seeds(seed=31):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
+# ==============================================================================
+# 3. Main Script
+# ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Deep Learning Training Loop")
-    parser.add_argument("--data_root", type=str, required=True, help="Path to processed 3D data")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--epoch_size", type=int, default=50000, help="Number of samples per epoch")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--image_path', type=str, default='./laura_preprocessing/output')
+    parser.add_argument('--tiles', type=str, default="00N_000E")
+    parser.add_argument("--save_dir", type=str, default="checkpoints")
+    parser.add_argument("--model_type", type=str, default="resunet", choices=["resunet", "resunet3d"])
+    parser.add_argument('--mode', type=str, default='snapshot', choices=['sequence', 'snapshot'])
+    parser.add_argument("--context_months", type=int, default=12)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--context_months", type=int, default=12, help="Input window length")
-    parser.add_argument("--model_type", type=str, default="resunet", choices=["resunet", "vivit", "convlstm3d", "resunet3d"])
-    parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save models")
-    parser.add_argument("--wandb_project", type=str, default="deforestation-prediction")
-    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument("--samples", type=int, default=10000)
+    parser.add_argument("--balance", type=int, default=1)
+    
+    # NIEUW: Limiet voor testen
+    parser.add_argument("--test_samples", type=int, default=50000, help="Max samples for testing phase")
+    
+    parser.add_argument("--seed", type=int, default=31)
+    parser.add_argument("--wandb_project", type=str, default="deforestation-repro")
     parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument('--mode', type=str, default='snapshot', choices=['sequence', 'snapshot'],
-                        help="Training mode: 'sequence' for 3D models, 'snapshot' for 2D models.")
-    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of warmup epochs")
-
+    
     args = parser.parse_args()
-
-    wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_run_name or f"{args.model_type}_ctx{args.context_months}",
-        config=vars(args)
-    )
-
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    fix_random_seeds(args.seed)
+    Path(args.save_dir).mkdir(exist_ok=True, parents=True)
+    wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    try:
-        # 1. Load Datasets
-        train_ds = DeforestationDataset(
-            args.data_root, 
-            "train", 
-            context_length=args.context_months, 
-            mode=args.mode, 
-            epoch_size=args.epoch_size)
+    # Paths
+    tile_list = args.tiles.split(",")
+    tr_img_paths = [os.path.join(args.image_path, f'{t}_var_train.npy') for t in tile_list]
+    tr_gt_paths = [os.path.join(args.image_path, f'{t}_gt_tr.npy') for t in tile_list] 
+    val_img_paths = [os.path.join(args.image_path, f'{t}_var_val.npy') for t in tile_list]
+    val_gt_paths = [os.path.join(args.image_path, f'{t}_gt_val.npy') for t in tile_list]
+    test_img_paths = [os.path.join(args.image_path, f'{t}_var_test.npy') for t in tile_list]
+    test_gt_paths = [os.path.join(args.image_path, f'{t}_gt_test.npy') for t in tile_list]
+    mask_paths = [os.path.join(args.image_path, f'{t}_mask.npy') for t in tile_list]
+
+    seq_len = args.context_months if args.mode == 'sequence' else 1
+    
+    # Dataset Preparation
+    logger.info("Generating Training Coordinates...")
+    train_coords = get_coordinates(tr_gt_paths, mask_paths, 64, seq_len, args.balance)
+    logger.info("Generating Validation Coordinates...")
+    val_coords = get_coordinates(val_gt_paths, mask_paths, 64, seq_len, args.balance)
+
+    train_ds = MultiTileDataset(tr_img_paths, tr_gt_paths, train_coords, 64, seq_len, args.samples)
+    val_ds = MultiTileDataset(val_img_paths, val_gt_paths, val_coords, 64, seq_len, args.samples // 5)
+    
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+
+    # Model Setup
+    sample_data = np.load(tr_img_paths[0], mmap_mode='r')
+    base_channels = sample_data.shape[0]
+    
+    if args.mode == 'sequence' and args.model_type == 'resunet':
+        in_channels = base_channels * seq_len
+    else:
+        in_channels = base_channels
+
+    logger.info(f"Model: {args.model_type} | Mode: {args.mode} | In Channels: {in_channels}")
+
+    if args.model_type == "resunet":
+        model = ResUNet(in_channels=in_channels, num_classes=1)
+    elif args.model_type == "resunet3d":
+        model = ResUNet3D(in_channels=base_channels, time_depth=seq_len, num_classes=1)
+
+    model = model.to(device)
+    optimizer = torch.optim.RAdam(model.parameters(), lr=args.lr)
+    criterion = CombinedLoss().to(device) 
+
+    # --- Training Loop ---
+    best_f05 = 0.0
+    
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0.0
+        random.shuffle(train_loader.dataset.coords)
         
-        val_ds = DeforestationDataset(
-            args.data_root,
-            "val", 
-            context_length=args.context_months, 
-            mode=args.mode, epoch_size=args.epoch_size // 2
-            )
-
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
-        # 2. Initialize Model
-        sample_X, _ = train_ds[0]
-        in_channels = sample_X.shape[0]
-        
-        # Determine time depth based on mode
-        if args.mode == 'snapshot':
-            time_depth = 1 
-        else: # 'sequence' mode
-            time_depth = args.context_months if args.context_months else 12
-
-        logger.info(f"Input Shape: C={in_channels}, T={time_depth}, H={sample_X.shape[-2]}, W={sample_X.shape[-1]}")
-
-        # Model Factory
-        if args.model_type == "resunet":
-            # 2D Model
-            model = ResUNet(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
-        elif args.model_type == "vivit":
-            model = ViViTSegmentation(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
-        elif args.model_type == "convlstm3d":
-            model = ConvLSTM3D(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
-        elif args.model_type == "resunet3d":
-            model = ResUNet3D(in_channels=in_channels, time_depth=time_depth, num_classes=1).to(device)
-        else:
-            raise ValueError(f"Model type '{args.model_type}' not implemented.")
-
-        optimizer = torch.optim.RAdam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-
-        # Select Loss Function
-        # criterion = WeightedFocalLoss(alpha=0.25, gamma=2.0).to(device)
-        criterion = CombinedLoss().to(device)
-
-        best_f05 = 0.0 
-        filename = f"{args.wandb_run_name or args.model_type}_best.pth"
-        best_model_path = save_dir / filename
-
-        # --- Training Loop ---
-        for epoch in range(args.epochs):
-            logger.info(f"Epoch {epoch + 1}/{args.epochs} started...")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        for X, y in pbar:
+            X, y = X.to(device), y.to(device)
             
-            # Unpack new return values
-            train_loss, train_auc, train_f05, train_prec, train_rec = train_one_epoch(
-                model, train_loader, optimizer, criterion, device, epoch, args
-            )
-            val_loss, val_auc, val_f05, val_prec, val_rec = validate(
-                model, val_loader, criterion, device
-            )
+            if args.model_type == 'resunet' and args.mode == 'sequence':
+                b, c, t, h, w = X.shape
+                X = X.view(b, c * t, h, w)
+            
+            optimizer.zero_grad()
+            logits = model(X)
+            if logits.shape[1] == 1: logits = logits.squeeze(1)
+            
+            # --- FIX: Negatieve Loss Preventie ---
+            valid_pixels = (y == 0) | (y == 1)
+            weight_mask = torch.ones_like(y, dtype=torch.float)
+            weight_mask[~valid_pixels] = 0.0
+            
+            y_safe = y.clone()
+            y_safe[~valid_pixels] = 0
+            
+            loss = criterion(logits, y_safe, weight_mask)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-            wandb.log({
-                "epoch": epoch + 1,
-                "train_loss": train_loss,
-                "train_pr_auc": train_auc,
-                "train_f05": train_f05, 
-                "train_precision": train_prec,
-                "train_recall": train_rec,
-                "val_loss": val_loss,
-                "val_pr_auc": val_auc,
-                "val_f05": val_f05,
-                "val_precision": val_prec,
-                "val_recall": val_rec
-            }, step=epoch + 1)
-
-            log_validation_visuals(model, val_loader, device, epoch + 1)
-
-            logger.info(f"Epoch {epoch + 1}: Val F0.5={val_f05:.4f} | Prec={val_prec:.4f} | Rec={val_rec:.4f}")
-
-            # Save based on F0.5 score
-            if val_f05 > best_f05:
-                best_f05 = val_f05
-                torch.save(model.state_dict(), best_model_path)
-                logger.info(f"--> New best model saved (F0.5: {best_f05:.4f})")
-
-        # --- Test Evaluation ---
-        logger.info("Training Complete. Starting Test Evaluation...")
+        avg_val_loss, val_f05 = validate(model, val_loader, criterion, device, args.model_type, args.mode)
         
-        # 1. Load Best Model
-        if best_model_path.exists():
-            model.load_state_dict(torch.load(best_model_path))
-        else:
-            logger.warning("No best model found, using last epoch model.")
+        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/len(train_loader):.4f} | Val F0.5 {val_f05:.4f}")
+        wandb.log({"train_loss": train_loss/len(train_loader), "val_f05": val_f05, "epoch": epoch+1})
         
-        # 2. Load Test Data
-        try:
-            test_ds = DeforestationDataset(args.data_root, "test", context_length=args.context_months, mode=args.mode)
-            test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
-        except Exception:
-            logger.error("Test set not found or empty. Skipping test evaluation.")
-            return
+        if val_f05 > best_f05:
+            best_f05 = val_f05
+            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
 
-        # 3. Find Optimal Threshold on Validation Set
-        # We re-run validation on the best model to get predictions
-        _, _, _, _, _, val_probs, val_targets = validate(model, val_loader, criterion, device, return_preds=True)
-        
-        if len(np.unique(val_targets)) > 1:
-            prec, rec, thresholds = precision_recall_curve(val_targets, val_probs)
-            beta = 0.5
-            fbeta = (1 + beta**2) * (prec * rec) / ((beta**2 * prec) + rec + 1e-8)
-            best_idx = np.argmax(fbeta)
-            best_threshold = thresholds[best_idx]
-            val_f05 = fbeta[best_idx]
-        else:
-            best_threshold = 0.5
-            val_f05 = 0.0
-        
-        logger.info(f"Optimal Threshold found on Val: {best_threshold:.4f} (Val F0.5: {val_f05:.4f})")
+    # --- Testing Phase ---
+    logger.info(f"Starting Testing Phase (Max {args.test_samples} samples)...")
+    
+    # FIX: Balance=0 met max_samples om OOM te voorkomen
+    test_coords = get_coordinates(test_gt_paths, mask_paths, 64, seq_len, balance=0, max_samples=args.test_samples)
+    
+    test_ds = MultiTileDataset(test_img_paths, test_gt_paths, test_coords, 64, seq_len, epoch_size=None)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    
+    # Load Best Model
+    best_path = os.path.join(args.save_dir, "best_model.pth")
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path))
+        logger.info(f"Loaded best model from {best_path}")
+    
+    test_loss, test_f05 = validate(model, test_loader, criterion, device, args.model_type, args.mode)
+    logger.info(f"FINAL TEST RESULTS: F0.5 = {test_f05:.4f}")
+    wandb.log({"test_f05": test_f05})
 
-        # 4. Evaluate on Test Set
-        test_loss, test_auc, _, _, _, test_probs, test_targets = validate(model, test_loader, criterion, device, return_preds=True)
-        
-        # Apply threshold
-        test_preds = (test_probs >= best_threshold).astype(int)
-        
-        test_precision = precision_score(test_targets, test_preds, zero_division=0)
-        test_recall = recall_score(test_targets, test_preds, zero_division=0)
-        test_f05 = fbeta_score(test_targets, test_preds, beta=0.5, zero_division=0)
 
-        logger.info("="*30)
-        logger.info(f"FINAL TEST RESULTS (at threshold {best_threshold:.4f})")
-        logger.info(f"Test Loss: {test_loss:.4f}")
-        logger.info(f"Test PR-AUC: {test_auc:.4f}")
-        logger.info(f"Test Precision: {test_precision:.4f}")
-        logger.info(f"Test Recall: {test_recall:.4f}")
-        logger.info(f"Test F0.5 Score: {test_f05:.4f}")
-        logger.info("="*30)
-
-        # Log to W&B
-        wandb.log({
-            "test_loss": test_loss,
-            "test_pr_auc": test_auc,
-            "test_precision": test_precision,
-            "test_recall": test_recall,
-            "test_f05": test_f05,
-            "optimal_threshold": best_threshold,
-            "test_pr_curve": wandb.plot.pr_curve(
-                test_targets, 
-                np.stack([1-test_probs, test_probs], axis=1), 
-                labels=["Forest", "Deforestation"]
-            )
-        })
-
-    except Exception as e:
-        logger.exception("An error occurred during execution.")
-        raise e
-    finally:
-        wandb.finish()
+def validate(model, loader, criterion, device, model_type, mode):
+    model.eval()
+    all_preds, all_targets = [], []
+    total_loss = 0
+    with torch.no_grad():
+        for X, y in tqdm(loader, desc="Val", leave=False):
+            X, y = X.to(device), y.to(device)
+            
+            if model_type == 'resunet' and mode == 'sequence':
+                b, c, t, h, w = X.shape
+                X = X.view(b, c * t, h, w)
+                
+            logits = model(X)
+            if logits.shape[1] == 1: logits = logits.squeeze(1)
+            
+            # Validatie loss ook veilig berekenen
+            valid_pixels = (y == 0) | (y == 1)
+            weight_mask = torch.ones_like(y, dtype=torch.float)
+            weight_mask[~valid_pixels] = 0.0
+            y_safe = y.clone()
+            y_safe[~valid_pixels] = 0
+            
+            loss = criterion(logits, y_safe, weight_mask)
+            total_loss += loss.item()
+            
+            probs = torch.sigmoid(logits)
+            if valid_pixels.sum() > 0:
+                all_preds.append(probs[valid_pixels].cpu().numpy())
+                all_targets.append(y[valid_pixels].cpu().numpy())
+                
+    f05 = 0.0
+    if all_targets:
+        y_true, y_scores = np.concatenate(all_targets), np.concatenate(all_preds)
+        if len(np.unique(y_true)) > 1:
+            prec, rec, _ = precision_recall_curve(y_true, y_scores)
+            fbeta = (1.25 * prec * rec) / (0.25 * prec + rec + 1e-8)
+            f05 = np.max(fbeta)
+    return total_loss/len(loader), f05
 
 if __name__ == "__main__":
     main()
