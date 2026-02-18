@@ -11,6 +11,7 @@ __pycache__/
 /data_6m/
 /slurm_requests/
 /laura_preprocessing/
+/laura_preprocessing_3d/
 /checks/
 test_results.log
 training_experiment.log

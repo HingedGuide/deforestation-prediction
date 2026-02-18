@@ -4,8 +4,7 @@ Script Name: Deep Learning Training Pipeline for Deforestation Analysis
 Description:
     This script trains deep learning models (2D ResUNet, 3D ResUNet, ConvLSTM, ViViT) 
     for deforestation prediction using satellite data. It supports both 2D (snapshot) 
-    and 3D (spatiotemporal) training modes, handles multi-tile datasets, and integrates 
-    with Weights & Biases for logging.
+    and 3D (spatiotemporal) training modes and handles multi-tile datasets.
 
     Key Features:
     - Multi-tile data loading with memory mapping (mmap) for efficiency.
@@ -13,6 +12,8 @@ Description:
     - Unbalanced (representative) sampling during testing.
     - Support for 'snapshot' (2D) and 'sequence' (3D) modes.
     - Automatic handling of 'No Data' pixels in loss calculation.
+    - Logs Precision, Recall, and Threshold alongside F0.5.
+    - Early Stopping implemented to prevent overfitting.
 """
 
 import argparse
@@ -22,7 +23,6 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
-import wandb
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
@@ -51,26 +51,48 @@ logger = setup_logger(__name__, log_file="training_experiment.log")
 
 
 # ==============================================================================
-# 1. Dataset Class
+# 1. Helper Classes (Dataset & EarlyStopping)
 # ==============================================================================
+
+class EarlyStopping:
+    """
+    Early stops the training if validation score doesn't improve after a given patience.
+    """
+    def __init__(self, patience=20, delta=0, verbose=False):
+        """
+        Args:
+            patience (int): How many epochs to wait after last time validation score improved.
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+            verbose (bool): If True, prints a message for each validation loss improvement.
+        """
+        self.patience = patience
+        self.delta = delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_score_max = -np.Inf
+
+    def __call__(self, val_score):
+        score = val_score
+
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
 
 class MultiTileDataset(Dataset):
     """
     PyTorch Dataset for loading multi-temporal satellite data from multiple .npy tiles.
-    
-    Uses memory mapping (mmap) to handle large files efficiently without loading
-    everything into RAM. Supports both 2D (single time step) and 3D (sequence) slicing.
     """
     def __init__(self, img_paths, gt_paths, coordinates, size_crops=64, sequence_length=1, epoch_size=None):
-        """
-        Args:
-            img_paths (list): List of paths to variable .npy files (Channels, Time, H, W).
-            gt_paths (list): List of paths to ground truth .npy files (Time, H, W).
-            coordinates (list): List of tuples (tile_idx, t, x, y) defining the samples.
-            size_crops (int): Spatial size of the crop (e.g., 64x64).
-            sequence_length (int): Number of time steps to include (1 for 2D, >1 for 3D).
-            epoch_size (int, optional): Limit the number of samples per epoch.
-        """
         self.img_paths = img_paths
         self.gt_paths = gt_paths
         self.coords = coordinates
@@ -92,47 +114,26 @@ class MultiTileDataset(Dataset):
         x_end, y_end = x + self.size_crops, y + self.size_crops
         
         # --- Load Input Data (Variables) ---
-        # Slicing: [Channels, Time (t:t+seq), Height (x:x_end), Width (y:y_end)]
         img_data = self.images[tile_idx][:, t : t + self.seq_len, x : x_end, y : y_end]
-        
-        # Use np.copy() to create a writable copy in RAM (avoids PyTorch warnings)
         X = torch.from_numpy(np.copy(img_data)).float()
         
-        # --- Dimension Handling ---
         # If 2D mode (seq_len=1), remove the time dimension -> (Channels, H, W)
-        # If 3D mode, keep (Channels, Time, H, W)
         if self.seq_len == 1:
             X = X.squeeze(1) 
 
         # --- Load Target Data (Ground Truth) ---
-        # We predict the label corresponding to the LAST time step of the sequence
         target_t = t + self.seq_len - 1
         gt_data = self.gts[tile_idx][target_t, x : x_end, y : y_end]
-        
         y = torch.from_numpy(np.copy(gt_data)).long()
 
         return X, y
 
 
 # ==============================================================================
-# 2. Coordinate Generator (Memory Optimized)
+# 2. Coordinate Generator
 # ==============================================================================
 
 def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance=1, max_samples=None):
-    """
-    Scans tiles to generate valid sample coordinates (Tile, Time, X, Y).
-    
-    Args:
-        gt_paths (list): Paths to Ground Truth files.
-        mask_paths (list): Paths to valid area masks.
-        size_crops (int): Crop size (to handle borders).
-        sequence_length (int): Length of the time sequence.
-        balance (int): 1 for balanced sampling (50/50), 0 for representative sampling.
-        max_samples (int): Max samples to collect (prevents OOM during testing).
-        
-    Returns:
-        list: A list of coordinate tuples.
-    """
     all_coordinates = [] 
     logger.info(f"Scanning {len(gt_paths)} tiles (Seq Len: {sequence_length})...")
 
@@ -144,11 +145,9 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
         mask = np.load(mask_path, mmap_mode='r')
         mask_data = np.array(mask)
         
-        # Ignore borders to ensure valid crops
         mask_data[:size_crops, :] = 0; mask_data[-size_crops:, :] = 0
         mask_data[:, :size_crops] = 0; mask_data[:, -size_crops:] = 0
 
-        # Calculate max valid start time to avoid sequence overflow
         max_time = gt_array.shape[0] - sequence_length + 1
         if max_time <= 0: continue
 
@@ -156,7 +155,6 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
             target_t = t + sequence_length - 1
             gt_slice = gt_array[target_t]
             
-            # --- Training Logic (Balanced Sampling) ---
             if balance == 1:
                 zeros = np.where((gt_slice == 0) & (mask_data == 1))
                 ones = np.where((gt_slice == 1) & (mask_data == 1))
@@ -165,31 +163,21 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
                 ones_coords = list(zip(ones[0], ones[1]))
                 
                 if len(zeros_coords) > 0 and len(ones_coords) > 0:
-                    # Balance classes 50/50 based on the minority class
                     n_samples = min(len(zeros_coords), len(ones_coords))
-                    
                     zeros_coords = random.sample(zeros_coords, n_samples)
                     ones_coords = random.sample(ones_coords, n_samples)
                     
                     for r, c in zeros_coords: all_coordinates.append((tile_idx, t, r, c))
                     for r, c in ones_coords: all_coordinates.append((tile_idx, t, r, c))
 
-            # --- Testing Logic (Unbalanced / Representative) ---
             elif balance == 0:
-                # Find indices of ALL valid pixels (Forest + Deforestation)
                 valid_mask = ((gt_slice == 0) | (gt_slice == 1)) & (mask_data == 1)
-                
-                # Get coordinates using np.where (efficient)
                 rows, cols = np.where(valid_mask)
                 total_valid = len(rows)
                 
                 if total_valid > 0:
-                    # Subsample in NumPy to avoid large Python lists and OOM errors
                     if max_samples:
-                        # Heuristic: Cap samples per frame to distribute coverage
-                        # Assuming e.g. 2000 samples per timestep is sufficient for robust stats
                         samples_to_take = min(total_valid, 2000) 
-                        
                         indices = np.random.choice(total_valid, samples_to_take, replace=False)
                         rows = rows[indices]
                         cols = cols[indices]
@@ -199,7 +187,6 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
 
     random.shuffle(all_coordinates)
     
-    # Global hard cap just in case
     if max_samples and len(all_coordinates) > max_samples:
         all_coordinates = all_coordinates[:max_samples]
         
@@ -208,9 +195,6 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
 
 
 def fix_random_seeds(seed=31):
-    """
-    Sets random seeds for reproducibility.
-    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
@@ -238,23 +222,22 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--samples", type=int, default=10000, help="Number of samples per training epoch")
+    parser.add_argument("--samples", type=int, default=50000, help="Number of samples per training epoch")
     parser.add_argument("--balance", type=int, default=1, help="1 = Balanced training (50/50), 0 = Imbalanced")
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs)")
     
     # Testing Configuration
     parser.add_argument("--test_samples", type=int, default=50000, help="Max samples for testing phase to prevent OOM")
     
     # Misc
     parser.add_argument("--seed", type=int, default=31, help="Random seed")
-    parser.add_argument("--wandb_project", type=str, default="deforestation-repro")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
     
     args = parser.parse_args()
     
     # Setup
     fix_random_seeds(args.seed)
     Path(args.save_dir).mkdir(exist_ok=True, parents=True)
-    wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Generate File Paths
@@ -287,14 +270,12 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
     # --- Model Setup ---
-    # Detect input channels from first file
     sample_data = np.load(tr_img_paths[0], mmap_mode='r')
     base_channels = sample_data.shape[0]
     
     if args.mode == 'sequence' and args.model_type == 'resunet':
-        # 2D ResUNet cannot natively handle sequence data without modification (flattening)
         in_channels = base_channels * seq_len
-        raise TypeError("2D ResUNet in sequence mode requires explicit channel flattening (Early Fusion) which is conceptually different from 3D models.")
+        raise TypeError("2D ResUNet in sequence mode requires explicit channel flattening.")
     else:
         in_channels = base_channels
 
@@ -314,19 +295,18 @@ def main():
     criterion = CombinedLoss().to(device) 
 
     # --- Training Loop ---
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
     best_f05 = 0.0
     
     for epoch in range(args.epochs):
         model.train()
         train_loss = 0.0
-        # Shuffle coordinates each epoch for better generalization
         random.shuffle(train_loader.dataset.coords)
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         for X, y in pbar:
             X, y = X.to(device), y.to(device)
             
-            # Handle potential flattening if using 2D model on sequence data (optional logic)
             if args.model_type == 'resunet' and args.mode == 'sequence':
                 b, c, t, h, w = X.shape
                 X = X.view(b, c * t, h, w)
@@ -336,15 +316,10 @@ def main():
             
             if logits.shape[1] == 1: logits = logits.squeeze(1)
             
-            # --- Robust Loss Calculation ---
-            # 1. Identify valid pixels (0 or 1)
             valid_pixels = (y == 0) | (y == 1)
-            
-            # 2. Create weight mask (0.0 for invalid pixels)
             weight_mask = torch.ones_like(y, dtype=torch.float)
             weight_mask[~valid_pixels] = 0.0
             
-            # 3. Safe target (prevent NaN/Inf in loss)
             y_safe = y.clone()
             y_safe[~valid_pixels] = 0
             
@@ -356,40 +331,56 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         # Validation phase
-        avg_val_loss, val_f05 = validate(model, val_loader, criterion, device, args.model_type, args.mode)
+        avg_val_loss, val_f05, val_prec, val_rec, val_thresh = validate(model, val_loader, criterion, device, args.model_type, args.mode)
         
-        logger.info(f"Epoch {epoch+1}: Train Loss {train_loss/len(train_loader):.4f} | Val F0.5 {val_f05:.4f}")
-        wandb.log({"train_loss": train_loss/len(train_loader), "val_f05": val_f05, "epoch": epoch+1})
+        logger.info(
+            f"Epoch {epoch+1}: Loss {train_loss/len(train_loader):.4f} | "
+            f"Val F0.5: {val_f05:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Thresh: {val_thresh:.4f}"
+        )
         
         # Save best model
         if val_f05 > best_f05:
             best_f05 = val_f05
-            torch.save(model.state_dict(), os.path.join(args.save_dir, "best_model.pth"))
+            save_path = os.path.join(args.save_dir, f"best_{args.model_type}.pth")
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"Saved best model to {save_path}")
+
+        # Early Stopping Check
+        early_stopping(val_f05)
+        if early_stopping.early_stop:
+            logger.info("Early stopping triggered! Model hasn't improved for {} epochs.".format(args.patience))
+            break
 
     # --- Testing Phase ---
     logger.info(f"Starting Testing Phase (Max {args.test_samples} samples)...")
     
-    # Generate test coordinates (Unbalanced, real-world distribution)
     test_coords = get_coordinates(test_gt_paths, mask_paths, 64, seq_len, balance=0, max_samples=args.test_samples)
-    
     test_ds = MultiTileDataset(test_img_paths, test_gt_paths, test_coords, 64, seq_len, epoch_size=None)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
     
-    # Load Best Model Weights
-    best_path = os.path.join(args.save_dir, "best_model.pth")
+    best_path = os.path.join(args.save_dir, f"best_{args.model_type}.pth")
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path))
         logger.info(f"Loaded best model from {best_path}")
+    else:
+        logger.warning(f"Best model not found at {best_path}. Testing with last epoch weights.")
     
-    test_loss, test_f05 = validate(model, test_loader, criterion, device, args.model_type, args.mode)
-    logger.info(f"FINAL TEST RESULTS: F0.5 = {test_f05:.4f}")
-    wandb.log({"test_f05": test_f05})
+    # Calculate metrics on test set
+    test_loss, test_f05, test_prec, test_rec, test_thresh = validate(model, test_loader, criterion, device, args.model_type, args.mode)
+    
+    logger.info("========================================")
+    logger.info(f"FINAL TEST RESULTS ({args.model_type}):")
+    logger.info(f"F0.5 Score: {test_f05:.4f}")
+    logger.info(f"Precision:  {test_prec:.4f}")
+    logger.info(f"Recall:     {test_rec:.4f}")
+    logger.info(f"Threshold:  {test_thresh:.4f}")
+    logger.info("========================================")
 
 
 def validate(model, loader, criterion, device, model_type, mode):
     """
     Validation / Testing Loop.
-    Calculates Loss and F0.5 Score on the provided loader.
+    Calculates Loss and returns F0.5, Precision, Recall, and the Threshold used.
     """
     model.eval()
     all_preds, all_targets = [], []
@@ -422,18 +413,37 @@ def validate(model, loader, criterion, device, model_type, mode):
                 all_preds.append(probs[valid_pixels].cpu().numpy())
                 all_targets.append(y[valid_pixels].cpu().numpy())
                 
-    # Calculate F0.5 Score
+    # Calculate Metrics
     f05 = 0.0
+    precision_val = 0.0
+    recall_val = 0.0
+    best_threshold = 0.5
+    
     if all_targets:
         y_true, y_scores = np.concatenate(all_targets), np.concatenate(all_preds)
+        
+        # Check if we have at least one positive and one negative sample to avoid sklearn errors
         if len(np.unique(y_true)) > 1:
-            prec, rec, _ = precision_recall_curve(y_true, y_scores)
+            prec, rec, thresholds = precision_recall_curve(y_true, y_scores)
+            
             # F-beta score: (1 + beta^2) * (P * R) / ((beta^2 * P) + R)
             # Beta = 0.5 (Favors precision)
             fbeta = (1.25 * prec * rec) / (0.25 * prec + rec + 1e-8)
-            f05 = np.max(fbeta)
             
-    return total_loss/len(loader), f05
+            # Find the index of the best F0.5 score
+            ix = np.argmax(fbeta)
+            
+            f05 = fbeta[ix]
+            precision_val = prec[ix]
+            recall_val = rec[ix]
+            
+            # Thresholds array is always 1 shorter than prec/rec arrays in sklearn
+            if ix < len(thresholds):
+                best_threshold = thresholds[ix]
+            else:
+                best_threshold = 1.0 
+            
+    return total_loss/len(loader), f05, precision_val, recall_val, best_threshold
 
 
 if __name__ == "__main__":
