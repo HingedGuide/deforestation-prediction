@@ -14,6 +14,8 @@ Description:
     - Automatic handling of 'No Data' pixels in loss calculation.
     - Logs Precision, Recall, and Threshold alongside F0.5.
     - Early Stopping implemented to prevent overfitting.
+    - Loads region-specific TIFF masks using rasterio.
+    - Prevents data leakage by locking the best threshold from validation for the test set.
 """
 
 import argparse
@@ -23,10 +25,11 @@ import logging
 import numpy as np
 import torch
 import torch.nn as nn
+import rasterio
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
-from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import precision_recall_curve, precision_score, recall_score, fbeta_score
 
 # --- Project Imports ---
 # Ensure these modules are accessible in your python path
@@ -71,7 +74,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_score_max = -np.Inf
+        self.val_score_max = -np.inf
 
     def __call__(self, val_score):
         score = val_score
@@ -134,6 +137,9 @@ class MultiTileDataset(Dataset):
 # ==============================================================================
 
 def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance=1, max_samples=None):
+    """
+    Extracts coordinates from the ground truth and limits them to the given TIFF masks.
+    """
     all_coordinates = [] 
     logger.info(f"Scanning {len(gt_paths)} tiles (Seq Len: {sequence_length})...")
 
@@ -142,9 +148,12 @@ def get_coordinates(gt_paths, mask_paths, size_crops, sequence_length=1, balance
 
     for tile_idx, (gt_path, mask_path) in enumerate(zip(gt_paths, mask_paths)):
         gt_array = np.load(gt_path, mmap_mode='r') 
-        mask = np.load(mask_path, mmap_mode='r')
-        mask_data = np.array(mask)
         
+        # Load the country-specific TIFF mask using rasterio
+        with rasterio.open(mask_path) as src:
+            mask_data = src.read(1)
+        
+        # Erase edges to avoid out-of-bounds crops
         mask_data[:size_crops, :] = 0; mask_data[-size_crops:, :] = 0
         mask_data[:, :size_crops] = 0; mask_data[:, -size_crops:] = 0
 
@@ -202,7 +211,77 @@ def fix_random_seeds(seed=31):
 
 
 # ==============================================================================
-# 3. Main Script
+# 3. Validation / Testing Loop
+# ==============================================================================
+
+def validate(model, loader, criterion, device, model_type, mode, threshold=None):
+    """
+    Validation / Testing Loop.
+    If 'threshold' is None, it finds the best threshold (Validation).
+    If 'threshold' is provided, it uses it to calculate metrics (Testing).
+    """
+    model.eval()
+    all_preds, all_targets = [], []
+    total_loss = 0
+    
+    with torch.no_grad():
+        for X, y in tqdm(loader, desc="Validating", leave=False):
+            X, y = X.to(device), y.to(device)
+            
+            if model_type == 'resunet' and mode == 'sequence':
+                b, c, t, h, w = X.shape
+                X = X.view(b, c * t, h, w)
+                
+            logits = model(X)
+            if logits.shape[1] == 1: logits = logits.squeeze(1)
+            
+            # Safe Loss Calculation
+            valid_pixels = (y == 0) | (y == 1)
+            weight_mask = torch.ones_like(y, dtype=torch.float)
+            weight_mask[~valid_pixels] = 0.0
+            y_safe = y.clone()
+            y_safe[~valid_pixels] = 0
+            
+            loss = criterion(logits, y_safe, weight_mask)
+            total_loss += loss.item()
+            
+            probs = torch.sigmoid(logits)
+            if valid_pixels.sum() > 0:
+                all_preds.append(probs[valid_pixels].cpu().numpy())
+                all_targets.append(y[valid_pixels].cpu().numpy())
+                
+    f05, precision_val, recall_val = 0.0, 0.0, 0.0
+    calc_threshold = 0.5
+    
+    if all_targets:
+        y_true = np.concatenate(all_targets)
+        y_scores = np.concatenate(all_preds)
+        
+        if len(np.unique(y_true)) > 1:
+            if threshold is None:
+                # Validation Phase: Find the best threshold for F0.5
+                prec, rec, thresholds = precision_recall_curve(y_true, y_scores)
+                fbeta = (1.25 * prec * rec) / (0.25 * prec + rec + 1e-8)
+                ix = np.argmax(fbeta)
+                
+                f05 = fbeta[ix]
+                precision_val = prec[ix]
+                recall_val = rec[ix]
+                calc_threshold = thresholds[ix] if ix < len(thresholds) else 1.0
+            else:
+                # Testing Phase: Use the fixed threshold from validation
+                calc_threshold = threshold
+                y_pred = (y_scores >= calc_threshold).astype(int)
+                
+                precision_val = precision_score(y_true, y_pred, zero_division=0)
+                recall_val = recall_score(y_true, y_pred, zero_division=0)
+                f05 = fbeta_score(y_true, y_pred, beta=0.5, zero_division=0)
+            
+    return total_loss/len(loader), f05, precision_val, recall_val, calc_threshold
+
+
+# ==============================================================================
+# 4. Main Script
 # ==============================================================================
 
 def main():
@@ -211,6 +290,7 @@ def main():
     # Data Paths
     parser.add_argument('--image_path', type=str, default='./laura_preprocessing/output', help="Root folder for .npy files")
     parser.add_argument('--tiles', type=str, default="00N_000E", help="Comma-separated list of tile IDs")
+    parser.add_argument('--country', type=str, default="Laos", help="Country name used in the TIFF mask filename")
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     
     # Model Configuration
@@ -230,12 +310,18 @@ def main():
     parser.add_argument("--test_samples", type=int, default=50000, help="Max samples for testing phase to prevent OOM")
     
     # Misc
-    parser.add_argument("--seed", type=int, default=31, help="Random seed")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
     
     args = parser.parse_args()
     
     # Setup
-    fix_random_seeds(args.seed)
+    # Initialize random seeds if a specific seed is provided by the user
+    if args.seed is not None:
+        fix_random_seeds(args.seed)
+        logger.info(f"Using fixed random seed: {args.seed}")
+    else:
+        logger.info("No fixed random seed provided. Run will be completely random.")
+
     Path(args.save_dir).mkdir(exist_ok=True, parents=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -251,7 +337,7 @@ def main():
     test_img_paths = [os.path.join(args.image_path, f'{t}_var_test.npy') for t in tile_list]
     test_gt_paths = [os.path.join(args.image_path, f'{t}_gt_test.npy') for t in tile_list]
     
-    mask_paths = [os.path.join(args.image_path, f'{t}_mask.npy') for t in tile_list]
+    mask_paths = [os.path.join(args.image_path, f'{t}_mask_{args.country}.tiff') for t in tile_list]
 
     # Determine Sequence Length
     seq_len = args.context_months if args.mode == 'sequence' else 1
@@ -297,6 +383,7 @@ def main():
     # --- Training Loop ---
     early_stopping = EarlyStopping(patience=args.patience, verbose=True)
     best_f05 = 0.0
+    best_thresh_global = 0.5  # Initialize the best threshold to pass to the test set
     
     for epoch in range(args.epochs):
         model.train()
@@ -330,17 +417,20 @@ def main():
             train_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # Validation phase
-        avg_val_loss, val_f05, val_prec, val_rec, val_thresh = validate(model, val_loader, criterion, device, args.model_type, args.mode)
+        # Validation phase (threshold=None so it searches for the best one)
+        avg_val_loss, val_f05, val_prec, val_rec, val_thresh = validate(
+            model, val_loader, criterion, device, args.model_type, args.mode, threshold=None
+        )
         
         logger.info(
             f"Epoch {epoch+1}: Loss {train_loss/len(train_loader):.4f} | "
             f"Val F0.5: {val_f05:.4f} | Prec: {val_prec:.4f} | Rec: {val_rec:.4f} | Thresh: {val_thresh:.4f}"
         )
         
-        # Save best model
+        # Save best model and best threshold
         if val_f05 > best_f05:
             best_f05 = val_f05
+            best_thresh_global = val_thresh  # Save the best threshold!
             save_path = os.path.join(args.save_dir, f"best_{args.model_type}.pth")
             torch.save(model.state_dict(), save_path)
             logger.info(f"Saved best model to {save_path}")
@@ -348,7 +438,7 @@ def main():
         # Early Stopping Check
         early_stopping(val_f05)
         if early_stopping.early_stop:
-            logger.info("Early stopping triggered! Model hasn't improved for {} epochs.".format(args.patience))
+            logger.info(f"Early stopping triggered! Model hasn't improved for {args.patience} epochs.")
             break
 
     # --- Testing Phase ---
@@ -365,86 +455,18 @@ def main():
     else:
         logger.warning(f"Best model not found at {best_path}. Testing with last epoch weights.")
     
-    # Calculate metrics on test set
-    test_loss, test_f05, test_prec, test_rec, test_thresh = validate(model, test_loader, criterion, device, args.model_type, args.mode)
+    # Calculate metrics on test set by passing the fixed threshold from validation
+    test_loss, test_f05, test_prec, test_rec, used_thresh = validate(
+        model, test_loader, criterion, device, args.model_type, args.mode, threshold=best_thresh_global
+    )
     
     logger.info("========================================")
     logger.info(f"FINAL TEST RESULTS ({args.model_type}):")
     logger.info(f"F0.5 Score: {test_f05:.4f}")
     logger.info(f"Precision:  {test_prec:.4f}")
     logger.info(f"Recall:     {test_rec:.4f}")
-    logger.info(f"Threshold:  {test_thresh:.4f}")
+    logger.info(f"Threshold:  {used_thresh:.4f} (Locked from Validation)")
     logger.info("========================================")
-
-
-def validate(model, loader, criterion, device, model_type, mode):
-    """
-    Validation / Testing Loop.
-    Calculates Loss and returns F0.5, Precision, Recall, and the Threshold used.
-    """
-    model.eval()
-    all_preds, all_targets = [], []
-    total_loss = 0
-    
-    with torch.no_grad():
-        for X, y in tqdm(loader, desc="Validating", leave=False):
-            X, y = X.to(device), y.to(device)
-            
-            if model_type == 'resunet' and mode == 'sequence':
-                b, c, t, h, w = X.shape
-                X = X.view(b, c * t, h, w)
-                
-            logits = model(X)
-            if logits.shape[1] == 1: logits = logits.squeeze(1)
-            
-            # --- Safe Loss Calculation ---
-            valid_pixels = (y == 0) | (y == 1)
-            weight_mask = torch.ones_like(y, dtype=torch.float)
-            weight_mask[~valid_pixels] = 0.0
-            y_safe = y.clone()
-            y_safe[~valid_pixels] = 0
-            
-            loss = criterion(logits, y_safe, weight_mask)
-            total_loss += loss.item()
-            
-            # Collect predictions for metric calculation
-            probs = torch.sigmoid(logits)
-            if valid_pixels.sum() > 0:
-                all_preds.append(probs[valid_pixels].cpu().numpy())
-                all_targets.append(y[valid_pixels].cpu().numpy())
-                
-    # Calculate Metrics
-    f05 = 0.0
-    precision_val = 0.0
-    recall_val = 0.0
-    best_threshold = 0.5
-    
-    if all_targets:
-        y_true, y_scores = np.concatenate(all_targets), np.concatenate(all_preds)
-        
-        # Check if we have at least one positive and one negative sample to avoid sklearn errors
-        if len(np.unique(y_true)) > 1:
-            prec, rec, thresholds = precision_recall_curve(y_true, y_scores)
-            
-            # F-beta score: (1 + beta^2) * (P * R) / ((beta^2 * P) + R)
-            # Beta = 0.5 (Favors precision)
-            fbeta = (1.25 * prec * rec) / (0.25 * prec + rec + 1e-8)
-            
-            # Find the index of the best F0.5 score
-            ix = np.argmax(fbeta)
-            
-            f05 = fbeta[ix]
-            precision_val = prec[ix]
-            recall_val = rec[ix]
-            
-            # Thresholds array is always 1 shorter than prec/rec arrays in sklearn
-            if ix < len(thresholds):
-                best_threshold = thresholds[ix]
-            else:
-                best_threshold = 1.0 
-            
-    return total_loss/len(loader), f05, precision_val, recall_val, best_threshold
-
 
 if __name__ == "__main__":
     main()
