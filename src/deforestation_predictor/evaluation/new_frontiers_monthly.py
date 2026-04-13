@@ -1,15 +1,14 @@
 """
-Script Name: Monthly Patch Size Evaluation Analysis
+Script Name: Monthly Emerging Frontiers Evaluation Analysis
 
 Description:
     This standalone script evaluates a trained deep learning model on the test
-    dataset and calculates the Recall broken down by both the prediction month 
-    and the size of the deforestation patches (connected components).
+    dataset and calculates performance metrics specifically for "emerging frontiers",
+    broken down by month. 
     
-    Patch size categories:
-    - Small: 1 to 9 pixels
-    - Medium: 10 to 49 pixels
-    - Large: >= 50 pixels
+    It isolates pixels that have not experienced any deforestation in the preceding 
+    X months (filtering out expansion) and groups the resulting F0.5, Precision, 
+    and Recall scores by the prediction month.
     
     The script dynamically handles both 2D pre-aggregated data (4D tensors) and 
     3D temporal sequences (5D tensors), allowing for fair baseline comparisons 
@@ -23,8 +22,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import recall_score
-from scipy.ndimage import label
+from sklearn.metrics import precision_score, recall_score, fbeta_score
 
 # --- Project Imports ---
 from deforestation_predictor.models.architectures import (
@@ -51,124 +49,123 @@ def get_model(model_type, in_channels, time_depth, device):
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
-def evaluate_patch_size_per_month(model, loader, device, model_type, mode, threshold):
+def evaluate_new_frontiers_per_month(model, loader, device, model_type, mode, threshold, lastmonth_channel, lookback_months):
     """
-    Evaluates the model on the test set and calculates Recall per patch size category
-    and per month. Uses scipy.ndimage.label to find connected components.
+    Evaluates the model on new deforestation frontiers and aggregates the metrics per month.
+    Dynamically handles 4D inputs (pre-aggregated 2D data) and 5D inputs (temporal 3D data).
     Assumes the 'month' variable is located at channel index 5.
     """
     model.eval()
     
-    categories = ['Small (< 10 px)', 'Medium (10 - 49 px)', 'Large (>= 50 px)']
+    # Initialize dictionary to hold predictions and targets for each month (1-12)
+    month_dict = {m: {'preds': [], 'targets': []} for m in range(1, 13)}
     
-    # Initialize nested dictionary: month -> category -> preds/targets
-    month_dict = {
-        m: {cat: {'preds': [], 'targets': []} for cat in categories}
-        for m in range(1, 13)
-    }
+    total_valid_pixels = 0
+    total_frontier_pixels = 0
 
     with torch.no_grad():
-        for X, y in tqdm(loader, desc="Testing Patch Sizes per Month"):
+        for X, y in tqdm(loader, desc=f"Testing Monthly Frontiers ({lookback_months}m lookback)"):
             X, y = X.to(device), y.to(device)
 
-            # Check tensor dimensions to dynamically handle both 2D and 3D inputs
+            # Check tensor dimensions to dynamically handle both 2D (aggregated) and 3D (temporal) inputs
             if X.dim() == 4:
-                # 2D Model Case: Data is pre-aggregated
+                # 2D Model Case: Data is pre-aggregated and sequence length is 1
+                # 'lastmonth_channel' already contains the historical aggregate in a single spatial layer
+                recent_def_sum = X[:, lastmonth_channel, :, :]
+                
+                # Extract the month value from channel 5
                 month_vals = X[:, 5, 0, 0]
+                
+                # Input is ready for 2D convolutions
                 X_input = X
                 
             elif X.dim() == 5:
                 # 3D Model Case: Data contains a sequence of time steps
                 if mode != 'sequence':
-                    raise ValueError("5D input requires mode='sequence' to access historical steps.")
+                    raise ValueError("5D input requires mode='sequence' to access historical 'lastmonth' steps.")
+                
+                # Slice the historical sequence and sum over the time dimension (dim=1)
+                historical_stack = X[:, lastmonth_channel, -lookback_months:, :, :]
+                recent_def_sum = torch.sum(historical_stack, dim=1)
                 
                 # Extract the month value from the last timestep
                 month_vals = X[:, 5, -1, 0, 0]
                 
-                # Reshape for 2D Early Fusion models expecting flattened time
+                # Reshape for 2D Early Fusion models expecting flattened time, or keep 5D for 3D models
                 b, c, t, h, w = X.shape
                 X_input = X.view(b, c * t, h, w) if model_type == 'resunet' else X
                 
             else:
                 raise ValueError(f"Unexpected input dimension from DataLoader: {X.dim()}")
 
+            # Create boolean mask for new frontiers
+            # True if there WAS deforestation in the lookback window
+            had_recent_def = recent_def_sum > 0 
+            # True if it is a strictly new frontier
+            is_new_frontier = ~had_recent_def
+            
             # Reverse the preprocessing normalization: round((val / 255) * 12)
             months = torch.round((month_vals / 255.0) * 12.0).int().cpu().numpy()
-
+            
             # Forward pass
             logits = model(X_input)
             if logits.shape[1] == 1:
                 logits = logits.squeeze(1)
 
-            probs = torch.sigmoid(logits).cpu().numpy()
-            targets = y.cpu().numpy()
+            probs = torch.sigmoid(logits)
+            
+            # Combine masks to get the final pixels for evaluation
+            valid_pixels = (y == 0) | (y == 1)
+            eval_mask = valid_pixels & is_new_frontier
+            
+            total_valid_pixels += valid_pixels.sum().item()
+            total_frontier_pixels += eval_mask.sum().item()
 
+            # Store the results in the corresponding month bin
             for i in range(X.shape[0]):
-                m = int(months[i])
-                if not (1 <= m <= 12):
-                    continue
-                
-                target_mask = targets[i]
-                prob_mask = probs[i]
-                
-                # Isolate the actual deforestation pixels (y == 1)
-                def_pixels = (target_mask == 1)
-                
-                # If there is no deforestation in this patch, skip
-                if not def_pixels.any():
-                    continue
-                
-                # Label connected components (clusters of 1s)
-                labeled_array, num_features = label(def_pixels)
-                
-                # Iterate over each unique deforestation patch found
-                for patch_idx in range(1, num_features + 1):
-                    patch_locs = (labeled_array == patch_idx)
-                    patch_size = patch_locs.sum()
-                    
-                    # Categorize based on pixel count
-                    if patch_size < 10:
-                        cat = 'Small (< 10 px)'
-                    elif patch_size < 50:
-                        cat = 'Medium (10 - 49 px)'
-                    else:
-                        cat = 'Large (>= 50 px)'
-                        
-                    # Store the predictions and actuals for this specific patch in the right month bin
-                    month_dict[m][cat]['preds'].append(prob_mask[patch_locs])
-                    month_dict[m][cat]['targets'].append(target_mask[patch_locs])
+                mask_i = eval_mask[i]
+                if mask_i.sum() > 0:
+                    m = int(months[i])
+                    if 1 <= m <= 12:
+                        month_dict[m]['preds'].append(probs[i][mask_i].cpu().numpy())
+                        month_dict[m]['targets'].append(y[i][mask_i].cpu().numpy())
 
-    # Calculate metrics (Recall) per month and category
+    # Calculate final metrics per month
     results = []
     for m in range(1, 13):
-        for cat in categories:
-            data = month_dict[m][cat]
-            if not data['targets']:
-                continue
+        if not month_dict[m]['targets']:
+            continue
 
-            y_true = np.concatenate(data['targets'])
-            y_scores = np.concatenate(data['preds'])
-            y_pred = (y_scores >= threshold).astype(int)
+        y_true = np.concatenate(month_dict[m]['targets'])
+        y_scores = np.concatenate(month_dict[m]['preds'])
+        y_pred = (y_scores >= threshold).astype(int)
 
-            rec = recall_score(y_true, y_pred, zero_division=0)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f05 = fbeta_score(y_true, y_pred, beta=0.5, zero_division=0)
 
-            results.append({
-                'Month': m,
-                'Patch Size': cat,
-                'Recall': rec,
-                'Total_Deforested_Pixels': len(y_true)
-            })
+        results.append({
+            'Month': m,
+            'F0.5': f05,
+            'Precision': prec,
+            'Recall': rec,
+            'Evaluated_Frontier_Pixels': len(y_true)
+        })
 
     df = pd.DataFrame(results)
+    
     if not df.empty:
-        # Sort values nicely for the output
-        df['Cat_Order'] = df['Patch Size'].map({'Small (< 10 px)': 0, 'Medium (10 - 49 px)': 1, 'Large (>= 50 px)': 2})
-        df = df.sort_values(['Month', 'Cat_Order']).drop(columns=['Cat_Order']).reset_index(drop=True)
+        df = df.sort_values('Month').reset_index(drop=True)
+        
+    print(f"\nTotal valid pixels processed: {total_valid_pixels}")
+    print(f"Total new frontier pixels evaluated: {total_frontier_pixels}")
+    if total_valid_pixels > 0:
+        print(f"Overall retention rate: {(total_frontier_pixels / total_valid_pixels * 100):.2f}%")
         
     return df
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate model recall per deforestation patch size and month.")
+    parser = argparse.ArgumentParser(description="Evaluate model on emerging frontiers per month.")
     
     # Data Paths
     parser.add_argument('--image_path', type=str, default='./laura_preprocessing/output', help="Root folder for .npy files")
@@ -179,7 +176,11 @@ def main():
     # Model Configuration
     parser.add_argument("--model_type", type=str, required=True, choices=["resunet", "resunet3d", "convlstm3d", "vivit"])
     parser.add_argument("--mode", type=str, default="sequence", choices=["sequence", "snapshot"])
-    parser.add_argument("--context_months", type=int, default=12, help="Sequence length for the input data")
+    parser.add_argument("--context_months", type=int, default=6, help="Sequence length for the input data")
+    
+    # Specific Frontier Arguments
+    parser.add_argument("--lastmonth_channel", type=int, default=0, help="Channel index of the 'lastmonth' variable (default: 0)")
+    parser.add_argument("--lookback_months", type=int, default=6, help="Number of months to check for recent deforestation")
     
     # Testing Configuration
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for DataLoader")
@@ -188,6 +189,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results", help="Directory to save the resulting CSV")
 
     args = parser.parse_args()
+    
+    # Quick sanity check for 3D models to ensure lookback doesn't exceed context
+    if args.context_months > 1 and args.lookback_months > args.context_months:
+        raise ValueError(f"lookback_months ({args.lookback_months}) cannot be greater than context_months ({args.context_months}) for temporal data.")
+        
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -226,18 +232,30 @@ def main():
     print(f"Loading weights from {args.checkpoint}...")
     model.load_state_dict(torch.load(args.checkpoint, map_location=device))
 
-    # 5. Evaluate Patch Sizes
-    print(f"Starting monthly patch size evaluation (Threshold: {args.threshold})...")
-    patch_df = evaluate_patch_size_per_month(model, test_loader, device, args.model_type, args.mode, args.threshold)
+    # 5. Evaluate Emerging Frontiers per Month
+    print(f"Starting monthly emerging frontiers evaluation (Threshold: {args.threshold})...")
+    monthly_df = evaluate_new_frontiers_per_month(
+        model, 
+        test_loader, 
+        device, 
+        args.model_type, 
+        args.mode, 
+        args.threshold,
+        args.lastmonth_channel,
+        args.lookback_months
+    )
 
     # 6. Output Results
-    print("\n=== Monthly Patch Size Performance ===")
-    print(patch_df.to_string(index=False))
+    if not monthly_df.empty:
+        print("\n=== Monthly Emerging Frontiers Performance ===")
+        print(monthly_df.to_string(index=False))
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    csv_path = os.path.join(args.output_dir, f"monthly_patch_size_results_{args.model_type}_{args.context_months}m.csv")
-    patch_df.to_csv(csv_path, index=False)
-    print(f"\nSaved results to {csv_path}")
+        os.makedirs(args.output_dir, exist_ok=True)
+        csv_path = os.path.join(args.output_dir, f"monthly_new_frontiers_{args.model_type}_{args.context_months}m_context_{args.lookback_months}m_lookback.csv")
+        monthly_df.to_csv(csv_path, index=False)
+        print(f"\nSaved results to {csv_path}")
+    else:
+        print("\nNo valid monthly data could be generated.")
 
 if __name__ == "__main__":
     main()

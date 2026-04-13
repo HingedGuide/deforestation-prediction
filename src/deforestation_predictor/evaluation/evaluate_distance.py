@@ -73,8 +73,8 @@ def evaluate_spatial_distance(model, loader, device, model_type, mode, threshold
             X, y = X.to(device), y.to(device)
 
             if mode == 'sequence':
-                # Grab the last time step for the past deforestation mask
-                past_def_vals = X[:, past_def_channel, -1, :, :].cpu().numpy()
+                past_def_vals = torch.sum(X[:, past_def_channel, :, :, :], dim=1).cpu().numpy()
+                
                 b, c, t, h, w = X.shape
                 X_input = X.view(b, c * t, h, w) if model_type == 'resunet' else X
             else:

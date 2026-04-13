@@ -5,6 +5,10 @@ Description:
     This standalone script evaluates a trained deep learning model on the test
     dataset and calculates performance metrics (F0.5, Precision, Recall) broken
     down by month. It works natively with MultiTile datasets.
+    
+    The script dynamically handles both 2D pre-aggregated data (4D tensors) and 
+    3D temporal sequences (5D tensors), allowing for fair baseline comparisons 
+    without requiring code changes.
 """
 
 import argparse
@@ -25,7 +29,7 @@ from deforestation_predictor.models.architectures import (
 from deforestation_predictor.training.train_experiment import MultiTileDataset, get_coordinates
 
 # ==============================================================================
-# 2. Evaluation Logic
+# Evaluation Logic
 # ==============================================================================
 
 def get_model(model_type, in_channels, time_depth, device):
@@ -46,6 +50,7 @@ def get_model(model_type, in_channels, time_depth, device):
 def evaluate_per_month(model, loader, device, model_type, mode, threshold):
     """
     Evaluates the model on the test set and calculates metrics per month.
+    Dynamically handles 4D inputs (pre-aggregated 2D data) and 5D inputs (temporal 3D data).
     Assumes the 'month' variable is located at channel index 5.
     """
     model.eval()
@@ -55,17 +60,31 @@ def evaluate_per_month(model, loader, device, model_type, mode, threshold):
         for X, y in tqdm(loader, desc="Testing per Month"):
             X, y = X.to(device), y.to(device)
 
-            if mode == 'sequence':
-                month_vals = X[:, 5, -1, 0, 0]
-                b, c, t, h, w = X.shape
-                X_input = X.view(b, c * t, h, w) if model_type == 'resunet' else X
-            else:
+            # Check tensor dimensions to dynamically handle both 2D (aggregated) and 3D (temporal) inputs
+            if X.dim() == 4:
+                # 2D Model Case: Data is pre-aggregated and sequence length is 1
                 month_vals = X[:, 5, 0, 0]
                 X_input = X
+                
+            elif X.dim() == 5:
+                # 3D Model Case: Data contains a sequence of time steps
+                if mode != 'sequence':
+                    raise ValueError("5D input requires mode='sequence' to access historical steps.")
+                
+                # Extract the month value from the last timestep
+                month_vals = X[:, 5, -1, 0, 0]
+                
+                # Reshape for 2D Early Fusion models expecting flattened time, or keep 5D for 3D models
+                b, c, t, h, w = X.shape
+                X_input = X.view(b, c * t, h, w) if model_type == 'resunet' else X
+                
+            else:
+                raise ValueError(f"Unexpected input dimension from DataLoader: {X.dim()}")
 
             # Reverse the preprocessing normalization: round((val / 255) * 12)
             months = torch.round((month_vals / 255.0) * 12.0).int().cpu().numpy()
 
+            # Forward pass
             logits = model(X_input)
             if logits.shape[1] == 1:
                 logits = logits.squeeze(1)
@@ -119,7 +138,7 @@ def main():
     # Model Configuration
     parser.add_argument("--model_type", type=str, required=True, choices=["resunet", "resunet3d", "convlstm3d", "vivit"])
     parser.add_argument("--mode", type=str, default="sequence", choices=["sequence", "snapshot"])
-    parser.add_argument("--context_months", type=int, default=12, help="Sequence length for 3D models")
+    parser.add_argument("--context_months", type=int, default=12, help="Sequence length for the input data")
     
     # Testing Configuration
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for DataLoader")
@@ -150,7 +169,7 @@ def main():
         print("No samples found in the test set. Exiting.")
         return
 
-    # 3. Determine input shapes
+    # 3. Determine input shapes dynamically
     sample_data = np.load(test_img_paths[0], mmap_mode='r')
     base_channels = sample_data.shape[0]
 
