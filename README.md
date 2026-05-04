@@ -32,8 +32,8 @@ src/deforestation_predictor/
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/HingedGuide/DL_Deforestation_Prediction
-   cd DL_Deforestation_Prediction
+   git clone https://github.com/HingedGuide/deforestation-prediction
+   cd deforestation-prediction
 
 2. Install the required dependencies:
    ```bash
