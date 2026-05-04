@@ -1,4 +1,10 @@
 # Spatio-Temporal Deforestation Prediction
+![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)
+![Weights & Biases](https://img.shields.io/badge/Weights_&_Biases-FFBE00?logo=weightsandbiases&logoColor=white)
+![Status](https://img.shields.io/badge/status-Master_Thesis-blueviolet)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 
 This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters from the [WWF Forest Foresight](https://forestforesight.atlassian.net/wiki/spaces/EWS/overview?homepageId=32961) project into machine-learning-ready 3D cubes. This repository was created as part of my Master's Thesis.
 
