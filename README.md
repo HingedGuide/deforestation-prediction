@@ -8,7 +8,7 @@
 
 This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters from the [WWF Forest Foresight](https://forestforesight.atlassian.net/wiki/spaces/EWS/overview?homepageId=32961) project into machine-learning-ready 3D cubes. The data for this repository can be downloaded via [this page](https://forestforesight.atlassian.net/wiki/spaces/EWS/pages/550535173/Downloading+Forest+Foresight+data) This repository was created as part of my Master's Thesis.
 
-[Read my full Master's Thesis here]
+[Read my full Master's Thesis here](MSc_thesis_Ties_Kuijpers.pdf)
 
 ## Results
 
