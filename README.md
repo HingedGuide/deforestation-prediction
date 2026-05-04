@@ -1,7 +1,6 @@
 # Spatio-Temporal Deforestation Prediction
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)
-![Weights & Biases](https://img.shields.io/badge/Weights_&_Biases-FFBE00?logo=weightsandbiases&logoColor=white)
 ![Status](https://img.shields.io/badge/status-Master_Thesis-blueviolet)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
