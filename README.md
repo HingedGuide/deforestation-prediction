@@ -16,16 +16,20 @@ src/deforestation_predictor/
 │   └── train_experiment.py        # Main DL training loop 
 ├── visualization/
 │   ├── predict_tile.py        # DL Inference on a full tile
-│   ├── predict_tile_xgboost.py # XGBoost inference on a full tile
 │   └── visualize_predictions.py # Visualization of samples
 └── utils/                     # Logging and filename parsing helpers
 ```
 
 ## Installation
-1. Clone repository
-2. Install the required dependencies:
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/HingedGuide/DL_Deforestation_Prediction
+   cd DL_Deforestation_Prediction
 
+2. Install the required dependencies:
 ```bash
+python -m venv venv
+source venv/bin/activate  # On Windows use: venv/Scripts/activate
 pip install -r requirements.txt
 ```
 ## Data processing
@@ -77,7 +81,7 @@ python -m src.deforestation_predictor.preprocessing.organize_data_normalize \
 ## Training
 ### Deep learning models
 
-Use `train_experiment.py` to train the Deep Learning models. This script integrates with Weights & Biases for experiment tracking.
+Use `train_experiment.py` to train the Deep Learning models.
 
 **Arguments:**
 - `--image_path`: Choose where the processed input files are stored
