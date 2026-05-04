@@ -1,3 +1,4 @@
+
 # Spatio-Temporal Deforestation Prediction
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?logo=PyTorch&logoColor=white)
@@ -29,7 +30,7 @@ The evaluation showed that convolutional models significantly outperformed the a
 3. **Generalization:** While the 3D ResUNet showed significant improvement in detecting new deforestation locations in Gabon, this performance did not perfectly generalize to other tested regions (Venezuela and Papua New Guinea) on a regional dataset.
 
 ### Visual Predictions
-*(Add a side-by-side image here of a satellite image, the ground truth deforestation, and your 2D ResUNet prediction. For example: `![Prediction vs Ground Truth](assets/prediction_comparison.png)`)*
+<img width="1250" height="868" alt="Schermafbeelding 2026-05-04 121543" src="https://github.com/user-attachments/assets/8609d6df-da78-4f48-9e33-e8afcff2be6e" />
 
 ## Directory Structure
 
