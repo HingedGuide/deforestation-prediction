@@ -7,6 +7,30 @@
 
 This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters from the [WWF Forest Foresight](https://forestforesight.atlassian.net/wiki/spaces/EWS/overview?homepageId=32961) project into machine-learning-ready 3D cubes. This repository was created as part of my Master's Thesis.
 
+## Results
+
+### Model Performance
+To evaluate the predictive performance of the models, the F0.5 score was used as the primary metric. This metric gives more weight to Precision than Recall, which is crucial for early warning systems where false positives need to be minimized. 
+
+The evaluation showed that convolutional models significantly outperformed the attention-based Video Vision Transformer (ViViT). Interestingly, explicitly modeling the spatio-temporal dependencies in 3D did not result in a universal improvement. The baseline 2D ResUNet, which aggregates the temporal context into a single feature map, achieved the highest overall performance.
+
+| Model | Architecture Type | Highest F0.5 Score |
+|-------|-------------------|--------------------|
+| **2D ResUNet** | Convolutional (Aggregated Temporal) | **0.6526** |
+| **3D ResUNet** | Convolutional (Spatio-Temporal) | Comparable to 2D |
+| **ConvLSTM3D** | Convolutional (Spatio-Temporal) | Comparable to 2D |
+| **ViViT** | Attention-based (Spatio-Temporal) | Lowest Performance |
+
+*(Note: The exact F0.5 scores vary depending on the prediction horizon and temporal context length, but the 2D ResUNet yielded the highest overall average.)*
+
+### Key Findings
+1. **Temporal Context:** A short historical context of 3 months was sufficient to capture the relevant dynamics of deforestation progression. Adding 6 or 12 months of historical data did not significantly improve the predictive value and sometimes introduced noise.
+2. **Prediction Horizon:** The models performed significantly better over longer prediction horizons compared to very short-term (1-month) predictions.
+3. **Generalization:** While the 3D ResUNet showed significant improvement in detecting new deforestation locations in Gabon, this performance did not perfectly generalize to other tested regions (Venezuela and Papua New Guinea) on a regional dataset.
+
+### Visual Predictions
+*(Add a side-by-side image here of a satellite image, the ground truth deforestation, and your 2D ResUNet prediction. For example: `![Prediction vs Ground Truth](assets/prediction_comparison.png)`)*
+
 ## Directory Structure
 
 ```text
