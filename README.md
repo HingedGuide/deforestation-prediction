@@ -1,6 +1,6 @@
 # Spatio-Temporal Deforestation Prediction
 
-This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (XGBoost, ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters into machine-learning-ready 3D cubes.
+This repository contains a deep learning framework for predicting deforestation events using 3D spatio-temporal satellite data. The project supports various architectures (ResUNet, ResUNet3D, ConvLSTM, ViViT) and includes a robust preprocessing pipeline to convert raw GeoTIFF rasters from the WWF Forest Foresight project into machine-learning-ready 3D cubes.
 
 ## Directory Structure
 
@@ -33,7 +33,7 @@ src/deforestation_predictor/
 pip install -r requirements.txt
 ```
 ## Data processing
-The preprocessing pipeline coverts raw `input` and `groundtruth` rasters into processed `.npz` files containing 3D tensors `[Channels, Time, Height, Width]`.
+The preprocessing pipeline coverts raw `input` and `groundtruth` rasters into processed `.npy` files containing 3D tensors `[Channels, Time, Height, Width]`.
 
 ### Key steps:
 1. **Mosaicing:** Merges individual tiles into a specific region (e.g. Gabon).
@@ -56,7 +56,7 @@ Use `train_experiment.py` to train the Deep Learning models. This script integra
 **Arguments:**
 - `--model_type`: Choose from `3dcnn`, `resunet`, `convlstm` or `vivit`
 - `--context_months`: Choose a number of past months to use as input.
-- `--data_root`: Choose a path to the directory containing `train/` and `val/` `.npz` files.
+- `--data_root`: Choose a path to the directory containing `train/` and `val/` `.npy` files.
 
 **Example Usage:**
 
@@ -70,25 +70,12 @@ python -m src.deforestation_predictor.training.train_experiment \
     --lr 1e-4
 ```
 
-### XGBoost Baseline
-
-A pixel-wise XGBoost classifier is provided as a baseline. It flattens the 3D data into tabular format and balances the classes via downsampling.
-
-```bash
-python -m src.deforestation_predictor.training.train_baseline_xgboost
-```
-Note: Ensure that the `DATA_ROOT` variable inside the script points to your processed data.
-
 ## Metrics and loss
 
 - **Loss function:** Focal loss is used to handle the extreme class imbalance between forest and deforestation pixels.
 - **Evaluation:** The primary metric is F0.5
-- **Visuals:** The training script automatically logs validation predictions (Input vs Groundtruth vs Prediction) to Weights & Biases.
 
-## Visualization
-
-Use `predict_tile.py` for predicting a full tile with a trained DL model. `predict_tile_xgboost.py` has the same function, but only works for XGBoost. 
-
+Use `predict_tile.py` for predicting a full tile with a trained DL model.
 ## Testing
 
 Unit tests are provided for the preprocessing and training logic.
