@@ -3,6 +3,7 @@ __pycache__/
 /data/
 /wandb/
 /logs/
+/tests/
 /results/
 /.vscode/
 /logs_6m_horizon/
