@@ -6,6 +6,15 @@ This repository contains a deep learning framework for predicting deforestation 
 
 ```text
 src/deforestation_predictor/
+├── evaluation/                    # Contains scripts that are used to evaluate the trained models
+│   ├── eval_new_frontiers.py
+│   ├── eval_test_set.py
+│   ├── evaluate_distance.py
+│   ├── evaluate_montly.py
+│   ├── friedman_test.py
+│   ├── nemeny_test.py
+│   ├── new_frontiers_montly.py
+│   └── patch_size_analysis
 ├── models/
 │   └── architectures.py           # DL Models: Simple3DCNN, ResUNet, ConvLSTM, ViViT
 ├── preprocessing/
@@ -15,9 +24,9 @@ src/deforestation_predictor/
 │   ├── loss.py                    # Combined Loss implementation
 │   └── train_experiment.py        # Main DL training loop 
 ├── visualization/
-│   ├── predict_tile.py        # DL Inference on a full tile
-│   └── visualize_predictions.py # Visualization of samples
-└── utils/                     # Logging and filename parsing helpers
+│   ├── predict_tile.py            # DL Inference on a full tile
+│   └── visualize_predictions.py   # Visualization of samples
+└── utils/                         # Logging and filename parsing helpers
 ```
 
 ## Installation
