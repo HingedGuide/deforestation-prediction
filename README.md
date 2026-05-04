@@ -27,11 +27,11 @@ src/deforestation_predictor/
    cd DL_Deforestation_Prediction
 
 2. Install the required dependencies:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows use: venv/Scripts/activate
-pip install -r requirements.txt
-```
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows use: venv/Scripts/activate
+   pip install -r requirements.txt
+   ```
 ## Data processing
 The preprocessing pipeline coverts raw `input` and `groundtruth` rasters into processed `.npy` files containing 3D tensors `[Channels, Time, Height, Width]`.
 
